@@ -15,7 +15,7 @@ from dispatcharr.display_timezone import DisplayTimezoneFormatter
 # Keys whose values are masked in a mapping, matched as whole delimiter-bounded words.
 _SENSITIVE_KEY_RE = re.compile(
     r"(?:^|_)(?:passphrase|password|passwd|pass|secret|token|api_?key|apikey|"
-    r"authorization|auth_?token|bearer|creds|credential|url)s?(?:$|_)"
+    r"authorization|auth_?token|bearer|creds|credential|cookie|url)s?(?:$|_)"
     r"|(?:^|_)(?:signature|sig)s?$",
     re.IGNORECASE,
 )
@@ -25,7 +25,7 @@ _CAMEL_BOUNDARY_RE = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
 _KEY_ALT = (
     r"username|user|password|passwd|pass|secret|signature|sig|"
     r"authorization|auth[_-]?token|bearer|"
-    r"x[_-]api[_-]key|api[_-]?key|apikey|token"
+    r"x[_-]api[_-]key|api[_-]?key|apikey|token|cookie"
 )
 
 # Optional compound-key prefix ("xc_password", "access_token"); must end in a delimiter.
@@ -84,11 +84,32 @@ _URL_LABEL = re.compile(
 #   HTTPSConnectionPool(host='portal.example', port=443)
 _HOST_KV = re.compile(r"(?i)\bhost=(['\"])[^'\"\s]+\1")
 
+# The same sensitive keys with a LIST value ('token': ['x']), the dict(QueryDict) shape.
+_DICT_LIST_KV = re.compile(
+    rf"(?ix)(?P<q>['\"])(?P<key>{_KEY_PREFIX}(?:{_KEY_ALT}))(?P=q)(?P<sep>\s*:\s*)"
+    r"\[(?P<body>[^\]]*)\]"
+)
+
+# Bare hostnames in DNS/timeout failure prose, which no key or URL shape catches.
+_RESOLVE_PROSE = re.compile(
+    r"(?i)\b((?:failed to resolve|could not resolve hostname)\s+')[^'\s]+(')"
+)
+_TIMEOUT_PROSE = re.compile(r"(?i)\b(connection to )[^\s']+( timed out)")
+
 
 def _redact_dict_kv(match):
     q, vq = match.group("q"), match.group("vq")
     key = match.group("key")
     return f"{q}{key}{q}{match.group('sep')}{vq}[{key.lower()}]{vq}"
+
+
+def _redact_dict_list_kv(match):
+    # A '[' in the body means it was already masked; leave it (idempotency).
+    if "[" in match.group("body"):
+        return match.group(0)
+    q = match.group("q")
+    key = match.group("key")
+    return f"{q}{key}{q}{match.group('sep')}[{q}[{key.lower()}]{q}]"
 
 
 def _redact_url_label(match):
@@ -123,6 +144,8 @@ def redact_text(value):
         and "/movie/" not in value
         and "/series/" not in value
         and "/timeshift/" not in value
+        and "resolve" not in value
+        and " timed out" not in value
     ):
         return value
     result = _URL_USERINFO.sub(r"\1[username]:[password]@", value)
@@ -137,8 +160,11 @@ def redact_text(value):
     result = _KV_ASSIGN.sub(
         lambda m: f"{m.group(1)}{m.group(2)}[{m.group(1).lower()}]", result
     )
+    result = _DICT_LIST_KV.sub(_redact_dict_list_kv, result)
     result = _URL_LABEL.sub(_redact_url_label, result)
     result = _HOST_KV.sub(lambda m: f"host={m.group(1)}[host]{m.group(1)}", result)
+    result = _RESOLVE_PROSE.sub(r"\1[host]\2", result)
+    result = _TIMEOUT_PROSE.sub(r"\1[host]\2", result)
     return result
 
 
