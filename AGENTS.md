@@ -34,7 +34,7 @@ Do not make application changes directly on `main`. Create a focused branch name
 - Do not introduce new dependencies or update lockfiles without approval.
 - Do not create database migrations unless a model change genuinely requires one.
 - Never edit or expose credentials, tokens, API keys, private keys or production data.
-- Do not add real IPTV provider URLs, usernames, passwords or playlist contents to the repository.
+- Do not add real IPTV provider URLs, usernames, passwords or playlist contents.
 - Do not remove, weaken or skip tests merely to make them pass.
 - Do not leave debug logging, `print()`, `console.log` or commented-out code.
 - Never run `git reset --hard`, `git clean`, force-push or delete the repository.
@@ -56,7 +56,42 @@ Treat the current repository configuration as authoritative if it differs from d
 
 Choose checks appropriate to the affected area.
 
-For backend changes, run focused tests first and then the broader applicable test suite. The documented backend test command is:
+For backend changes, run focused tests first and then the broader applicable test suite.
 
-```bash
-python manage.py test
+The documented backend test command is:
+
+    python manage.py test
+
+When using the `uv` environment, use:
+
+    uv run python manage.py test
+
+For frontend changes, run the appropriate existing scripts from the `frontend` directory:
+
+    npm run lint
+    npm run test
+    npm run build
+
+For Docker configuration changes, validate the relevant Compose configuration without starting or replacing production services.
+
+Before installing dependencies, starting containers or running commands that require network access, explain what will happen and request approval.
+
+After making changes:
+
+1. Review `git status`.
+2. Review the complete `git diff`.
+3. Check for accidental generated files, secrets and unrelated formatting.
+4. Report all commands run and their results.
+5. Separate pre-existing failures from failures caused by the change.
+6. Describe any manual testing that remains necessary.
+
+## Final response
+
+Finish every implementation task with:
+
+- Summary of the implemented behaviour
+- Files changed
+- Tests and checks performed
+- Results and any pre-existing failures
+- Remaining risks or manual verification
+- Confirmation that nothing was committed or pushed unless requested
