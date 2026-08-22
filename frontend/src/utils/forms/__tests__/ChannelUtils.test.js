@@ -145,6 +145,7 @@ describe('ChannelUtils', () => {
         tvg_id: 'hbo.us',
         tvc_guide_stationid: 'hbo-station',
         epg_data_id: 'epg-1',
+        epg_time_offset_minutes: '',
         logo_id: '10',
         user_level: '1',
         is_adult: false,
@@ -242,11 +243,24 @@ describe('ChannelUtils', () => {
         tvg_id: '',
         tvc_guide_stationid: '',
         epg_data_id: '',
+        epg_time_offset_minutes: '',
         logo_id: '',
         user_level: '0',
         is_adult: false,
         hidden_from_output: false,
       });
+    });
+
+    it('preserves a numeric epg_time_offset_minutes', () => {
+      const channel = makeChannel({ epg_time_offset_minutes: 180 });
+      const result = getChannelFormDefaultValues(channel, makeChannelGroups());
+      expect(result.epg_time_offset_minutes).toBe(180);
+    });
+
+    it('defaults epg_time_offset_minutes to empty string when null', () => {
+      const channel = makeChannel({ epg_time_offset_minutes: null });
+      const result = getChannelFormDefaultValues(channel, makeChannelGroups());
+      expect(result.epg_time_offset_minutes).toBe('');
     });
   });
 
@@ -334,6 +348,41 @@ describe('ChannelUtils', () => {
         name: 'HBO',
       });
       expect(result.name).toBe('HBO');
+    });
+
+    it('converts empty epg_time_offset_minutes to null', () => {
+      const result = getFormattedValues({
+        stream_profile_id: '1',
+        tvg_id: 'x',
+        epg_time_offset_minutes: '',
+      });
+      expect(result.epg_time_offset_minutes).toBeNull();
+    });
+
+    it('converts missing epg_time_offset_minutes to null', () => {
+      const result = getFormattedValues({
+        stream_profile_id: '1',
+        tvg_id: 'x',
+      });
+      expect(result.epg_time_offset_minutes).toBeNull();
+    });
+
+    it('converts a string epg_time_offset_minutes to a number', () => {
+      const result = getFormattedValues({
+        stream_profile_id: '1',
+        tvg_id: 'x',
+        epg_time_offset_minutes: '90',
+      });
+      expect(result.epg_time_offset_minutes).toBe(90);
+    });
+
+    it('treats a zero epg_time_offset_minutes as no shift (null)', () => {
+      const result = getFormattedValues({
+        stream_profile_id: '1',
+        tvg_id: 'x',
+        epg_time_offset_minutes: 0,
+      });
+      expect(result.epg_time_offset_minutes).toBeNull();
     });
   });
 
@@ -472,6 +521,44 @@ describe('ChannelUtils', () => {
           makeChannelStreams()
         )
       ).rejects.toThrow('Update error');
+    });
+
+    describe('when channel is auto_created', () => {
+      it('sends the offset directly on the channel payload (no override row)', async () => {
+        const channel = makeChannel({ auto_created: true });
+        const values = makeValues({ epg_data_id: 'epg-1' });
+        const formatted = makeFormattedValues({
+          epg_data_id: 'epg-1',
+          hidden_from_output: false,
+          epg_time_offset_minutes: 180,
+        });
+
+        await handleEpgUpdate(channel, values, formatted, makeChannelStreams());
+
+        expect(API.setChannelEPG).not.toHaveBeenCalled();
+        expect(API.updateChannel).toHaveBeenCalledWith({
+          id: 'ch-1',
+          hidden_from_output: false,
+          epg_time_offset_minutes: 180,
+          override: null,
+        });
+      });
+
+      it('sends null epg_time_offset_minutes when the offset is blank', async () => {
+        const channel = makeChannel({ auto_created: true });
+        const values = makeValues({ epg_data_id: 'epg-1' });
+        const formatted = makeFormattedValues({
+          epg_data_id: 'epg-1',
+          hidden_from_output: false,
+          epg_time_offset_minutes: null,
+        });
+
+        await handleEpgUpdate(channel, values, formatted, makeChannelStreams());
+
+        expect(API.updateChannel).toHaveBeenCalledWith(
+          expect.objectContaining({ epg_time_offset_minutes: null })
+        );
+      });
     });
   });
 

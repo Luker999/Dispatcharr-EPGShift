@@ -43,6 +43,7 @@ from .models import (
     Recording,
     RecurringRecordingRule,
 )
+from .epg_offset import validate_epg_time_offset_minutes
 from .serializers import (
     StreamSerializer,
     ChannelSerializer,
@@ -1173,6 +1174,20 @@ class ChannelViewSet(viewsets.ModelViewSet):
                 })
                 continue
 
+            # The bulk write path (bulk_update) bypasses model validation, so
+            # enforce the shared ±1440 offset rule on the raw payload up front.
+            if "epg_time_offset_minutes" in channel_data:
+                try:
+                    validate_epg_time_offset_minutes(
+                        channel_data["epg_time_offset_minutes"]
+                    )
+                except ValueError as exc:
+                    errors.append({
+                        "channel_id": channel_id,
+                        "errors": {"epg_time_offset_minutes": [str(exc)]},
+                    })
+                    continue
+
             # Handle channel_group_id conversion
             if 'channel_group_id' in channel_data:
                 group_id = channel_data['channel_group_id']
@@ -1740,6 +1755,8 @@ class ChannelViewSet(viewsets.ModelViewSet):
         queryset = with_effective_values(
             self.filter_queryset(self.get_queryset())
         )
+        # epg_time_offset_minutes lives directly on Channel (no override
+        # support) and drives the TV Guide's per-channel display shift.
         return JsonResponse(
             [
                 {
@@ -1750,6 +1767,7 @@ class ChannelViewSet(viewsets.ModelViewSet):
                     "channel_number": row["effective_channel_number"],
                     "epg_data_id": row["effective_epg_data_id"],
                     "channel_group_id": row["effective_channel_group_id"],
+                    "epg_time_offset_minutes": row["epg_time_offset_minutes"],
                 }
                 for row in queryset.values(
                     "id",
@@ -1759,6 +1777,7 @@ class ChannelViewSet(viewsets.ModelViewSet):
                     "effective_channel_number",
                     "effective_epg_data_id",
                     "effective_channel_group_id",
+                    "epg_time_offset_minutes",
                 )
             ],
             safe=False,

@@ -236,6 +236,262 @@ describe('guideUtils', () => {
       expect(list[0].startMs).toBe(1000);
       expect(list[1].startMs).toBe(3000);
     });
+
+    it('should shift programs for channels with a positive epg_time_offset', () => {
+      const nowMs = dayjs('2024-01-01T09:00:00Z').valueOf();
+      vi.mocked(dateTimeUtils.getNowMs).mockReturnValue(nowMs);
+
+      const startTime = '2024-01-01T10:00:00Z';
+      const endTime = '2024-01-01T11:00:00Z';
+      const startMs = dayjs(startTime).valueOf();
+      const endMs = dayjs(endTime).valueOf();
+      const offsetMs = 180 * 60000; // 3h later
+
+      const programs = [{ tvg_id: 'tvg-1', start_time: startTime, end_time: endTime }];
+      const channelIdByTvgId = new Map([['tvg-1', [1, 2]]]);
+      const offsetMinutesByChannel = { 2: 180 };
+
+      const result = guideUtils.mapProgramsByChannel(
+        programs,
+        channelIdByTvgId,
+        offsetMinutesByChannel
+      );
+
+      const unshifted = result.get(1)[0];
+      const shifted = result.get(2)[0];
+
+      // Unshifted channel keeps source times
+      expect(unshifted.startMs).toBe(startMs);
+      expect(unshifted.endMs).toBe(endMs);
+      expect(unshifted.start_time).toBe(startTime);
+
+      // Shifted channel gets a clone with shifted times and derived fields
+      expect(shifted).not.toBe(unshifted);
+      expect(shifted.startMs).toBe(startMs + offsetMs);
+      expect(shifted.endMs).toBe(endMs + offsetMs);
+      expect(shifted.start_time).toBe(
+        new Date(startMs + offsetMs).toISOString()
+      );
+      expect(shifted.end_time).toBe(new Date(endMs + offsetMs).toISOString());
+      expect(shifted.programStart.valueOf()).toBe(startMs + offsetMs);
+      expect(shifted.programEnd.valueOf()).toBe(endMs + offsetMs);
+
+      // Source object is never mutated
+      expect(programs[0].start_time).toBe(startTime);
+      expect(programs[0].end_time).toBe(endTime);
+    });
+
+    it('should not shift when offset is missing, null, or zero', () => {
+      const nowMs = dayjs('2024-01-01T09:00:00Z').valueOf();
+      vi.mocked(dateTimeUtils.getNowMs).mockReturnValue(nowMs);
+
+      const programs = [{ tvg_id: 'tvg-1', startMs: 1000, endMs: 2000 }];
+      const channelIdByTvgId = new Map([['tvg-1', [1, 2, 3]]]);
+      const offsetMinutesByChannel = { 2: null, 3: 0 };
+
+      const result = guideUtils.mapProgramsByChannel(
+        programs,
+        channelIdByTvgId,
+        offsetMinutesByChannel
+      );
+
+      expect(result.get(1)[0]).toBe(result.get(2)[0]);
+      expect(result.get(1)[0]).toBe(result.get(3)[0]);
+      expect(result.get(1)[0].startMs).toBe(1000);
+    });
+
+    it('should recompute isLive/isPast for the shifted copy', () => {
+      const startMs = dayjs('2024-01-01T10:00:00Z').valueOf();
+      const endMs = dayjs('2024-01-01T11:00:00Z').valueOf();
+      const nowMs = dayjs('2024-01-01T10:30:00Z').valueOf();
+      vi.mocked(dateTimeUtils.getNowMs).mockReturnValue(nowMs);
+
+      const programs = [{ tvg_id: 'tvg-1', startMs, endMs }];
+      const channelIdByTvgId = new Map([['tvg-1', [1, 2]]]);
+      const offsetMinutesByChannel = { 2: 120 }; // airs 2h later
+
+      const result = guideUtils.mapProgramsByChannel(
+        programs,
+        channelIdByTvgId,
+        offsetMinutesByChannel
+      );
+
+      const unshifted = result.get(1)[0];
+      const shifted = result.get(2)[0];
+
+      // Source program (10:00-11:00) is live at 10:30
+      expect(unshifted.isLive).toBe(true);
+      expect(unshifted.isPast).toBe(false);
+
+      // Shifted copy (12:00-13:00) is not live yet at 10:30
+      expect(shifted.startMs).toBe(startMs + 2 * 3600000);
+      expect(shifted.isLive).toBe(false);
+      expect(shifted.isPast).toBe(false);
+    });
+
+    it('should drop entries whose shifted interval misses the display window', () => {
+      const startMs = dayjs('2024-01-01T10:00:00Z').valueOf();
+      const endMs = dayjs('2024-01-01T11:00:00Z').valueOf();
+      vi.mocked(dateTimeUtils.getNowMs).mockReturnValue(startMs - 60000);
+
+      // Display window: 09:00–12:00. Unshifted program (10:00-11:00)
+      // intersects; with a +2h offset the copy (12:00-13:00) starts exactly
+      // at the window end, so the shifted entry is dropped.
+      const displayWindowMs = {
+        startMs: dayjs('2024-01-01T09:00:00Z').valueOf(),
+        endMs: dayjs('2024-01-01T12:00:00Z').valueOf(),
+      };
+
+      const programs = [{ tvg_id: 'tvg-1', startMs, endMs }];
+      const channelIdByTvgId = new Map([['tvg-1', [1, 2]]]);
+      const offsetMinutesByChannel = { 2: 120 };
+
+      const result = guideUtils.mapProgramsByChannel(
+        programs,
+        channelIdByTvgId,
+        offsetMinutesByChannel,
+        displayWindowMs
+      );
+
+      expect(result.get(1).map((p) => p.startMs)).toEqual([startMs]);
+      expect(result.get(2)).toBeUndefined();
+    });
+
+    it('should keep shifted entries that intersect the display window', () => {
+      const startMs = dayjs('2024-01-01T10:00:00Z').valueOf();
+      const endMs = dayjs('2024-01-01T11:00:00Z').valueOf();
+      vi.mocked(dateTimeUtils.getNowMs).mockReturnValue(startMs - 60000);
+
+      // Display window 09:00–14:00 covers the shifted copy (12:00-13:00).
+      const displayWindowMs = {
+        startMs: dayjs('2024-01-01T09:00:00Z').valueOf(),
+        endMs: dayjs('2024-01-01T14:00:00Z').valueOf(),
+      };
+
+      const programs = [{ tvg_id: 'tvg-1', startMs, endMs }];
+      const channelIdByTvgId = new Map([['tvg-1', [1, 2]]]);
+      const offsetMinutesByChannel = { 2: 120 };
+
+      const result = guideUtils.mapProgramsByChannel(
+        programs,
+        channelIdByTvgId,
+        offsetMinutesByChannel,
+        displayWindowMs
+      );
+
+      expect(result.get(1).map((p) => p.startMs)).toEqual([startMs]);
+      expect(result.get(2).map((p) => p.startMs)).toEqual([startMs + 120 * 60000]);
+    });
+
+    it('should keep entries straddling either display-window edge', () => {
+      const startMs = dayjs('2024-01-01T08:00:00Z').valueOf();
+      const endMs = dayjs('2024-01-01T09:30:00Z').valueOf();
+      vi.mocked(dateTimeUtils.getNowMs).mockReturnValue(startMs);
+
+      // Window starts at 09:00; program 08:00-09:30 straddles it.
+      const displayWindowMs = {
+        startMs: dayjs('2024-01-01T09:00:00Z').valueOf(),
+        endMs: dayjs('2024-01-01T12:00:00Z').valueOf(),
+      };
+
+      const programs = [{ tvg_id: 'tvg-1', startMs, endMs }];
+      const channelIdByTvgId = new Map([['tvg-1', [1]]]);
+
+      const result = guideUtils.mapProgramsByChannel(
+        programs,
+        channelIdByTvgId,
+        {},
+        displayWindowMs
+      );
+
+      expect(result.get(1).map((p) => p.startMs)).toEqual([startMs]);
+    });
+
+    it('should include all entries when no display window is provided', () => {
+      const startMs = dayjs('2024-01-01T10:00:00Z').valueOf();
+      const endMs = dayjs('2024-01-01T11:00:00Z').valueOf();
+      vi.mocked(dateTimeUtils.getNowMs).mockReturnValue(startMs);
+
+      const programs = [{ tvg_id: 'tvg-1', startMs, endMs }];
+      const channelIdByTvgId = new Map([['tvg-1', [1, 2]]]);
+      const offsetMinutesByChannel = { 2: 120 };
+
+      const result = guideUtils.mapProgramsByChannel(
+        programs,
+        channelIdByTvgId,
+        offsetMinutesByChannel
+      );
+
+      expect(result.get(1).map((p) => p.startMs)).toEqual([startMs]);
+      expect(result.get(2).map((p) => p.startMs)).toEqual([startMs + 120 * 60000]);
+    });
+  });
+
+  // ── selectTimelinePrograms ─────────────────────────────────────────────────
+
+  describe('selectTimelinePrograms', () => {
+    const nowMs = dayjs('2024-01-01T12:00:00Z').valueOf();
+    const h = 60 * 60 * 1000;
+
+    it('should return an empty list for empty or null input', () => {
+      expect(guideUtils.selectTimelinePrograms([], nowMs)).toEqual([]);
+      expect(guideUtils.selectTimelinePrograms(null, nowMs)).toEqual([]);
+    });
+
+    it('should keep programmes intersecting [now - 1h, now + 24h]', () => {
+      const programs = [
+        { tvg_id: 'a', startMs: nowMs - 30 * 60000, endMs: nowMs + 30 * 60000 },
+        // Backfill straddler: ended 30 min ago, started 2h ago
+        { tvg_id: 'b', startMs: nowMs - 2 * h, endMs: nowMs - 30 * 60000 },
+        // Horizon straddler: starts inside, ends 2h past the horizon
+        { tvg_id: 'c', startMs: nowMs + 23 * h, endMs: nowMs + 26 * h },
+      ];
+
+      const result = guideUtils.selectTimelinePrograms(programs, nowMs);
+      expect(result.map((p) => p.tvg_id)).toEqual(['a', 'b', 'c']);
+    });
+
+    it('should exclude offset padding outside the un-widened grid range', () => {
+      // Fetched only because some channel is shifted +24h: starts exactly
+      // one minute past now + 24h.
+      const padding = {
+        tvg_id: 'padding',
+        startMs: nowMs + 24 * h + 60000,
+        endMs: nowMs + 25 * h,
+      };
+      // Fetched only because some channel is shifted -24h: ends one minute
+      // before now - 1h.
+      const backfillPadding = {
+        tvg_id: 'backfill-padding',
+        startMs: nowMs - 25 * h,
+        endMs: nowMs - h - 60000,
+      };
+
+      const result = guideUtils.selectTimelinePrograms(
+        [padding, backfillPadding],
+        nowMs
+      );
+      expect(result).toEqual([]);
+    });
+
+    it('should use startMs/endMs when present and fall back to ISO strings', () => {
+      const programs = [
+        { tvg_id: 'a', startMs: nowMs, endMs: nowMs + h },
+        {
+          tvg_id: 'b',
+          start_time: new Date(nowMs).toISOString(),
+          end_time: new Date(nowMs + h).toISOString(),
+        },
+        {
+          tvg_id: 'c',
+          start_time: new Date(nowMs + 30 * h).toISOString(),
+          end_time: new Date(nowMs + 31 * h).toISOString(),
+        },
+      ];
+
+      const result = guideUtils.selectTimelinePrograms(programs, nowMs);
+      expect(result.map((p) => p.tvg_id)).toEqual(['a', 'b']);
+    });
   });
 
   // ── computeRowHeights ─────────────────────────────────────────────────────

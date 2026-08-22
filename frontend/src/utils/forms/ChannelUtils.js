@@ -202,6 +202,7 @@ export const getChannelFormDefaultValues = (channel, channelGroups) => {
     tvg_id: tvgId || '',
     tvc_guide_stationid: gracenoteId || '',
     epg_data_id: epgDataId ?? '',
+    epg_time_offset_minutes: channel?.epg_time_offset_minutes ?? '',
     logo_id: logoId ? `${logoId}` : '',
     user_level: `${channel?.user_level ?? '0'}`,
     is_adult: channel?.is_adult ?? false,
@@ -227,6 +228,14 @@ export const getFormattedValues = (values) => {
   formattedValues.tvc_guide_stationid =
     formattedValues.tvc_guide_stationid || null;
 
+  // Empty offset means "no shift" (null on the API)
+  formattedValues.epg_time_offset_minutes =
+    formattedValues.epg_time_offset_minutes === '' ||
+    formattedValues.epg_time_offset_minutes === undefined ||
+    formattedValues.epg_time_offset_minutes === null
+      ? null
+      : Number(formattedValues.epg_time_offset_minutes) || null;
+
   return formattedValues;
 };
 
@@ -243,9 +252,12 @@ export const handleEpgUpdate = async (
   // it is a status flag, not a value replacement.
   if (channel.auto_created) {
     const overridePayload = buildOverridePayload(channel, formattedValues);
+    // epg_time_offset_minutes lives directly on Channel (no override support),
+    // so it is sent for auto-created channels as well.
     const payload = {
       id: channel.id,
       hidden_from_output: formattedValues.hidden_from_output,
+      epg_time_offset_minutes: formattedValues.epg_time_offset_minutes,
     };
     if (overridePayload !== undefined) {
       payload.override = overridePayload;

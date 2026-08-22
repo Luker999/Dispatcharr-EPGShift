@@ -341,6 +341,16 @@ class Channel(models.Model):
         blank=True,
         related_name="channels",
     )
+    epg_time_offset_minutes = models.IntegerField(
+        null=True,
+        blank=True,
+        default=None,
+        help_text=(
+            "Shift EPG program times for this channel by this many minutes. "
+            "Positive means the channel airs programs later than the EPG "
+            "source's times (e.g. a delayed re-broadcast)."
+        ),
+    )
 
     stream_profile = models.ForeignKey(
         StreamProfile,

@@ -515,8 +515,9 @@ const ChannelForm = ({ channel: channelProp = null, isOpen, onClose }) => {
   }, [defaultValues, channel, reset, epgs, tvgsById]);
 
   const epgDataId = watch('epg_data_id');
+  const epgTimeOffsetMinutes = watch('epg_time_offset_minutes');
   const { currentProgram, isLoadingProgram, hasFetchedProgram } =
-    useEpgPreview(epgDataId);
+    useEpgPreview(epgDataId, epgTimeOffsetMinutes);
 
   // Memoize logo options to prevent infinite re-renders during background loading
   const logoOptions = useMemo(() => {
@@ -1191,6 +1192,19 @@ const ChannelForm = ({ channel: channelProp = null, isOpen, onClose }) => {
                   </ScrollArea>
                 </PopoverDropdown>
               </Popover>
+
+              <NumberInput
+                id="epg_time_offset_minutes"
+                name="epg_time_offset_minutes"
+                label="EPG time offset (minutes)"
+                description="Shift displayed program times for this channel. Positive = the channel airs later than the EPG source (e.g. delayed re-broadcast). Blank = no shift."
+                value={watch('epg_time_offset_minutes')}
+                onChange={(value) => setValue('epg_time_offset_minutes', value)}
+                size="xs"
+                step={5}
+                min={-1440}
+                max={1440}
+              />
 
               {(isLoadingProgram || hasFetchedProgram || currentProgram) && (
                 <Box mt="xs" p="xs">

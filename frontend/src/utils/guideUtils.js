@@ -60,7 +60,62 @@ export function buildChannelIdMap(channels, tvgsById, epgs = {}) {
   return map;
 }
 
-export const mapProgramsByChannel = (programs, channelIdByTvgId) => {
+/**
+ * The EPG grid API serves [now - 1h, now + 24h] widened by the largest
+ * channel offset so shifted channels keep coverage. Only the un-widened
+ * range may extend the visible timeline, so timeline expansion must be
+ * computed from programmes that intersect that range only.
+ */
+export const GRID_BACKFILL_MS = 60 * 60 * 1000; // now - 1h
+export const GRID_HORIZON_MS = 24 * 60 * 60 * 1000; // now + 24h
+
+/**
+ * Select the raw programmes that may extend the visible timeline: those
+ * intersecting the un-widened grid range [nowMs - 1h, nowMs + 24h].
+ * Programmes fetched only as offset padding fall entirely outside it and
+ * are excluded (programmes straddling either edge are kept).
+ */
+export const selectTimelinePrograms = (programs, nowMs) => {
+  if (!programs?.length) {
+    return [];
+  }
+  const windowStartMs = nowMs - GRID_BACKFILL_MS;
+  const windowEndMs = nowMs + GRID_HORIZON_MS;
+  return programs.filter((program) => {
+    const startMs = program.startMs ?? convertToMs(program.start_time);
+    const endMs = program.endMs ?? convertToMs(program.end_time);
+    return startMs < windowEndMs && endMs > windowStartMs;
+  });
+};
+
+/**
+ * Return a shifted copy of a mapped program for a channel with a non-zero
+ * epg_time_offset_minutes. The base object (shared with unshifted channels)
+ * is never mutated.
+ */
+const shiftProgramData = (programData, offsetMinutes, nowMs) => {
+  const offsetMs = offsetMinutes * 60000;
+  const shiftedStartMs = programData.startMs + offsetMs;
+  const shiftedEndMs = programData.endMs + offsetMs;
+  return {
+    ...programData,
+    start_time: new Date(shiftedStartMs).toISOString(),
+    end_time: new Date(shiftedEndMs).toISOString(),
+    startMs: shiftedStartMs,
+    endMs: shiftedEndMs,
+    programStart: initializeTime(shiftedStartMs),
+    programEnd: initializeTime(shiftedEndMs),
+    isLive: nowMs >= shiftedStartMs && nowMs < shiftedEndMs,
+    isPast: nowMs >= shiftedEndMs,
+  };
+};
+
+export const mapProgramsByChannel = (
+  programs,
+  channelIdByTvgId,
+  offsetMinutesByChannel = {},
+  displayWindowMs = null
+) => {
   if (!programs?.length || !channelIdByTvgId?.size) {
     return new Map();
   }
@@ -90,10 +145,30 @@ export const mapProgramsByChannel = (programs, channelIdByTvgId) => {
 
     // Add this program to all channels that share the same TVG ID
     channelIds.forEach((channelId) => {
+      const offsetMinutes =
+        Number(offsetMinutesByChannel?.[channelId]) || 0;
+      const channelProgramData =
+        offsetMinutes === 0
+          ? programData
+          : shiftProgramData(programData, offsetMinutes, nowMs);
+      // When a display window is provided, keep only the entries whose
+      // shifted interval intersects it. The backend pads the source query
+      // so shifted channels keep coverage; without this, padded programmes
+      // would stretch the visible timeline. Programmes straddling either
+      // boundary are preserved (strict interval intersection).
+      if (
+        displayWindowMs &&
+        !(
+          channelProgramData.startMs < displayWindowMs.endMs &&
+          channelProgramData.endMs > displayWindowMs.startMs
+        )
+      ) {
+        return;
+      }
       if (!map.has(channelId)) {
         map.set(channelId, []);
       }
-      map.get(channelId).push(programData);
+      map.get(channelId).push(channelProgramData);
     });
   });
 

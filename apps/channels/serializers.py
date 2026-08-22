@@ -24,6 +24,7 @@ from rest_framework import serializers
 from django.utils import timezone
 from core.utils import validate_flexible_url, build_absolute_uri_with_port
 from apps.channels.utils import coerce_channel_profile_ids
+from apps.channels.epg_offset import validate_epg_time_offset_minutes
 
 
 class LogoSerializer(serializers.ModelSerializer):
@@ -371,6 +372,33 @@ class ChannelOverrideSerializer(serializers.ModelSerializer):
 #
 # Channel
 #
+class EpgTimeOffsetMinutesField(serializers.Field):
+    """Per-channel EPG time offset (minutes), validated by the shared ±1440
+    rule in ``apps.channels.epg_offset``.
+
+    A plain ``IntegerField`` is not used because it would silently coerce
+    values such as ``"1.0"`` or ``1.0``; the shared function is applied to
+    the raw value so every write surface enforces one identical rule
+    (booleans, fractional numbers, malformed strings and out-of-range
+    values are rejected). ``None``/blank mean "no shift requested".
+    """
+
+    default_error_messages = {
+        "invalid": (
+            "epg_time_offset_minutes must be an integer between -1440 and 1440."
+        ),
+    }
+
+    def to_internal_value(self, data):
+        try:
+            return validate_epg_time_offset_minutes(data)
+        except ValueError as exc:
+            raise serializers.ValidationError(str(exc))
+
+    def to_representation(self, value):
+        return value
+
+
 class ChannelSerializer(serializers.ModelSerializer):
     # Show nested group data, or ID
     # Ensure channel_number is explicitly typed as FloatField and properly validated
@@ -387,6 +415,15 @@ class ChannelSerializer(serializers.ModelSerializer):
         source="epg_data",
         required=False,
         allow_null=True,
+    )
+    epg_time_offset_minutes = EpgTimeOffsetMinutesField(
+        required=False,
+        allow_null=True,
+        help_text=(
+            "Shift EPG program times for this channel by this many minutes "
+            "(-1440 to 1440). Positive means the channel airs programs later "
+            "than the EPG source's times. Null clears the shift."
+        ),
     )
 
     stream_profile_id = serializers.PrimaryKeyRelatedField(
@@ -445,6 +482,7 @@ class ChannelSerializer(serializers.ModelSerializer):
             "tvg_id",
             "tvc_guide_stationid",
             "epg_data_id",
+            "epg_time_offset_minutes",
             "streams",
             "stream_profile_id",
             "uuid",

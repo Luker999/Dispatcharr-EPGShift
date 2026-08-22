@@ -1580,10 +1580,15 @@ export default class API {
     }
   }
 
-  static async getCurrentProgramForEpg(epgId) {
+  static async getCurrentProgramForEpg(epgId, timeOffsetMinutes) {
+    const body = { epg_data_ids: [epgId] };
+    const offset = Number(timeOffsetMinutes) || 0;
+    if (offset) {
+      body.time_offset_minutes = offset;
+    }
     const response = await request(`${host}/api/epg/current-programs/`, {
       method: 'POST',
-      body: { epg_data_ids: [epgId] },
+      body,
     });
 
     if (response && response.length > 0) {

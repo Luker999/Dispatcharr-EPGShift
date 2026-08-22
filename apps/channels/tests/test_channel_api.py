@@ -666,3 +666,202 @@ class ChannelListOnlyCatchupFilterTests(TestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         sql = " ".join(q["sql"] for q in ctx.captured_queries).upper()
         self.assertNotIn("DISTINCT", sql)
+
+
+class ChannelEpgTimeOffsetAPITests(TestCase):
+    """epg_time_offset_minutes round-trips through the channel API."""
+
+    def setUp(self):
+        self.user = User.objects.create_user(
+            username="testuser", password="testpass123"
+        )
+        self.user.user_level = 10
+        self.user.save()
+        self.client = APIClient()
+        self.client.force_authenticate(user=self.user)
+        self.bulk_edit_url = "/api/channels/channels/edit/bulk/"
+
+        self.group = ChannelGroup.objects.create(name="Offset Group")
+        self.channel = Channel.objects.create(
+            channel_number=10.0,
+            name="Offset Channel",
+            channel_group=self.group,
+        )
+
+    def test_default_offset_is_null(self):
+        self.assertIsNone(self.channel.epg_time_offset_minutes)
+
+    def test_list_response_includes_offset(self):
+        self.channel.epg_time_offset_minutes = 180
+        self.channel.save()
+
+        response = self.client.get(
+            "/api/channels/channels/",
+            {"page": 1, "page_size": 50},
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        row = next(
+            row for row in response.data["results"] if row["id"] == self.channel.id
+        )
+        self.assertEqual(row["epg_time_offset_minutes"], 180)
+
+    def test_bulk_edit_sets_offset(self):
+        response = self.client.patch(
+            self.bulk_edit_url,
+            [{"id": self.channel.id, "epg_time_offset_minutes": 180}],
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(
+            response.data["channels"][0]["epg_time_offset_minutes"], 180
+        )
+        self.channel.refresh_from_db()
+        self.assertEqual(self.channel.epg_time_offset_minutes, 180)
+
+    def test_bulk_edit_accepts_negative_offset(self):
+        response = self.client.patch(
+            self.bulk_edit_url,
+            [{"id": self.channel.id, "epg_time_offset_minutes": -45}],
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.channel.refresh_from_db()
+        self.assertEqual(self.channel.epg_time_offset_minutes, -45)
+
+    def test_bulk_edit_clears_offset_with_null(self):
+        self.channel.epg_time_offset_minutes = -120
+        self.channel.save()
+
+        response = self.client.patch(
+            self.bulk_edit_url,
+            [{"id": self.channel.id, "epg_time_offset_minutes": None}],
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.channel.refresh_from_db()
+        self.assertIsNone(self.channel.epg_time_offset_minutes)
+
+    # ── Shared ±1440 validation ─────────────────────────────────────────
+
+    def test_summary_response_includes_offset(self):
+        """C1 regression: the TV Guide summary (getChannelsSummary) must
+        carry epg_time_offset_minutes or per-channel display shifts never
+        reach the frontend."""
+        self.channel.epg_time_offset_minutes = -45
+        self.channel.save()
+
+        response = self.client.get("/api/channels/channels/summary/")
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        rows = {row["id"]: row for row in response.json()}
+        self.assertIn("epg_time_offset_minutes", rows[self.channel.id])
+        self.assertEqual(rows[self.channel.id]["epg_time_offset_minutes"], -45)
+
+    def test_single_update_accepts_max_offset(self):
+        response = self.client.patch(
+            f"/api/channels/channels/{self.channel.id}/",
+            {"epg_time_offset_minutes": 1440},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.channel.refresh_from_db()
+        self.assertEqual(self.channel.epg_time_offset_minutes, 1440)
+
+    def test_single_update_accepts_min_offset(self):
+        response = self.client.patch(
+            f"/api/channels/channels/{self.channel.id}/",
+            {"epg_time_offset_minutes": -1440},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.channel.refresh_from_db()
+        self.assertEqual(self.channel.epg_time_offset_minutes, -1440)
+
+    def test_single_update_rejects_offset_above_max(self):
+        response = self.client.patch(
+            f"/api/channels/channels/{self.channel.id}/",
+            {"epg_time_offset_minutes": 1441},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("epg_time_offset_minutes", response.data)
+        self.channel.refresh_from_db()
+        self.assertIsNone(self.channel.epg_time_offset_minutes)
+
+    def test_single_update_rejects_offset_below_min(self):
+        response = self.client.patch(
+            f"/api/channels/channels/{self.channel.id}/",
+            {"epg_time_offset_minutes": -1441},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("epg_time_offset_minutes", response.data)
+        self.channel.refresh_from_db()
+        self.assertIsNone(self.channel.epg_time_offset_minutes)
+
+    def test_single_update_rejects_non_integer_offsets(self):
+        for bad_value in (True, 1.5, "90.5", "ninety"):
+            with self.subTest(value=bad_value):
+                response = self.client.patch(
+                    f"/api/channels/channels/{self.channel.id}/",
+                    {"epg_time_offset_minutes": bad_value},
+                    format="json",
+                )
+                self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+                self.assertIn("epg_time_offset_minutes", response.data)
+
+        self.channel.refresh_from_db()
+        self.assertIsNone(self.channel.epg_time_offset_minutes)
+
+    def test_bulk_edit_accepts_boundary_offsets(self):
+        for boundary in (1440, -1440):
+            with self.subTest(boundary=boundary):
+                response = self.client.patch(
+                    self.bulk_edit_url,
+                    [{"id": self.channel.id, "epg_time_offset_minutes": boundary}],
+                    format="json",
+                )
+                self.assertEqual(response.status_code, status.HTTP_200_OK)
+                self.channel.refresh_from_db()
+                self.assertEqual(self.channel.epg_time_offset_minutes, boundary)
+
+    def test_bulk_edit_rejects_out_of_range_without_partial_update(self):
+        """One invalid offset in the batch must reject the whole request;
+        the valid entry must not be persisted."""
+        other = Channel.objects.create(
+            channel_number=11.0,
+            name="Other Channel",
+            channel_group=self.group,
+        )
+
+        response = self.client.patch(
+            self.bulk_edit_url,
+            [
+                {"id": other.id, "epg_time_offset_minutes": -45},
+                {"id": self.channel.id, "epg_time_offset_minutes": 1441},
+            ],
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertTrue(
+            any(
+                isinstance(entry.get("errors"), dict)
+                and "epg_time_offset_minutes" in entry["errors"]
+                for entry in response.data["errors"]
+            ),
+            response.data["errors"],
+        )
+
+        other.refresh_from_db()
+        self.channel.refresh_from_db()
+        self.assertIsNone(other.epg_time_offset_minutes)
+        self.assertIsNone(self.channel.epg_time_offset_minutes)

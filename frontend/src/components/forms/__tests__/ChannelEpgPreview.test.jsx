@@ -42,7 +42,7 @@ describe('Channel EPG preview hook', () => {
     const { result } = renderHook(() => useEpgPreview(10));
 
     await waitFor(() => {
-      expect(API.getCurrentProgramForEpg).toHaveBeenCalledWith(10);
+      expect(API.getCurrentProgramForEpg).toHaveBeenCalledWith(10, undefined);
       expect(result.current.currentProgram).toEqual(program);
       expect(result.current.isLoadingProgram).toBe(false);
       expect(result.current.hasFetchedProgram).toBe(true);

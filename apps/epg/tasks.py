@@ -3076,11 +3076,14 @@ def build_programme_index_task(source_id, _defer_retry=0):
         release_task_lock(_EPG_SOURCE_FILE_LOCK, source_id)
 
 
-def find_current_program_for_tvg_id(epg_or_id):
+def find_current_program_for_tvg_id(epg_or_id, as_of=None):
     """
     Look up the currently-airing program for an EPGData instance (or id) using
     the byte-offset index. If no index exists yet, queue an async build and let
     the caller retry rather than doing a blocking scan.
+
+    ``as_of`` overrides the reference time (e.g. to apply a channel's EPG
+    time offset); defaults to now.
 
     Returns dict, None, or "timeout".
     """
@@ -3104,7 +3107,7 @@ def find_current_program_for_tvg_id(epg_or_id):
     if not file_path or not os.path.exists(file_path):
         return None
 
-    now = timezone.now()
+    now = as_of or timezone.now()
     # The property reads the EPGSourceIndex table fresh on each access, so a
     # concurrent refresh invalidating/rebuilding the index can't serve stale state.
     index = source.programme_index

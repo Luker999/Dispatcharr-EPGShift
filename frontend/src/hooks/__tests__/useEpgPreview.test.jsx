@@ -68,7 +68,21 @@ describe('useEpgPreview', () => {
         await vi.runAllTimersAsync();
       });
 
-      expect(API.getCurrentProgramForEpg).toHaveBeenCalledWith('epg-42');
+      expect(API.getCurrentProgramForEpg).toHaveBeenCalledWith(
+        'epg-42',
+        undefined,
+      );
+    });
+
+    it('forwards the offset minutes to the API when provided', async () => {
+      vi.mocked(API.getCurrentProgramForEpg).mockResolvedValue({ id: 1 });
+      renderHook(() => useEpgPreview('epg-1', 120));
+
+      await act(async () => {
+        await vi.runAllTimersAsync();
+      });
+
+      expect(API.getCurrentProgramForEpg).toHaveBeenCalledWith('epg-1', 120);
     });
 
     it('sets currentProgram to the returned program', async () => {
@@ -291,8 +305,14 @@ describe('useEpgPreview', () => {
         await vi.runAllTimersAsync();
       });
 
-      expect(API.getCurrentProgramForEpg).toHaveBeenCalledWith('epg-1');
-      expect(API.getCurrentProgramForEpg).toHaveBeenCalledWith('epg-2');
+      expect(API.getCurrentProgramForEpg).toHaveBeenCalledWith(
+        'epg-1',
+        undefined,
+      );
+      expect(API.getCurrentProgramForEpg).toHaveBeenCalledWith(
+        'epg-2',
+        undefined,
+      );
     });
   });
 

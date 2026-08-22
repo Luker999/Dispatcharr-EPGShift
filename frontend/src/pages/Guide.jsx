@@ -62,6 +62,7 @@ import {
   PROGRAM_HEIGHT,
   PX_PER_MS,
   calcProgressPct,
+  selectTimelinePrograms,
   sortChannels,
   evaluateSeriesRulesByTvgId,
 } from '../utils/guideUtils';
@@ -266,19 +267,37 @@ export default function TVChannelGuide({ startDate, endDate }) {
     ? initializeTime(endDate)
     : add(defaultStart, 24, 'hour');
 
+  // The grid API widens its fetch window by the largest channel offset so
+  // shifted channels keep coverage. Only the un-widened range may extend
+  // the visible timeline, so expansion considers only programmes
+  // intersecting it. Reuses the component's `now` state — no extra
+  // current-time sampling.
+  const nowMs = convertToMs(now);
+  const timelinePrograms = useMemo(
+    () => selectTimelinePrograms(programs, nowMs),
+    [programs, nowMs]
+  );
+
   // Expand timeline if needed based on actual earliest/ latest program
   const earliestProgramStart = useMemo(
-    () => calculateEarliestProgramStart(programs, defaultStart),
-    [programs, defaultStart]
+    () => calculateEarliestProgramStart(timelinePrograms, defaultStart),
+    [timelinePrograms, defaultStart]
   );
 
   const latestProgramEnd = useMemo(
-    () => calculateLatestProgramEnd(programs, defaultEnd),
-    [programs, defaultEnd]
+    () => calculateLatestProgramEnd(timelinePrograms, defaultEnd),
+    [timelinePrograms, defaultEnd]
   );
 
   const start = calculateStart(earliestProgramStart, defaultStart);
   const end = calculateEnd(latestProgramEnd, defaultEnd);
+
+  // The actual display window in ms. Shifted per-channel entries are
+  // filtered against it so padded programmes cannot stretch the timeline.
+  const displayWindowMs = useMemo(
+    () => ({ startMs: convertToMs(start), endMs: convertToMs(end) }),
+    [start, end]
+  );
 
   // Pre-compute timeline origin in ms for horizontal culling in GuideRow
   const timelineStartMs = useMemo(() => convertToMs(start), [start]);
@@ -299,9 +318,34 @@ export default function TVChannelGuide({ startDate, endDate }) {
     return map;
   }, [guideChannels]);
 
+  // Channel id -> epg_time_offset_minutes (only channels with a non-zero
+  // offset) so shifted channels display source programs at their air time.
+  const offsetMinutesByChannelId = useMemo(() => {
+    const offsets = {};
+    for (const ch of guideChannels) {
+      const offset = Number(ch?.epg_time_offset_minutes) || 0;
+      if (offset && ch?.id !== undefined && ch?.id !== null) {
+        offsets[ch.id] = offset;
+      }
+    }
+    return offsets;
+  }, [guideChannels]);
+
   const programsByChannelId = useMemo(
-    () => mapProgramsByChannel(programs, channelIdByTvgId),
-    [programs, channelIdByTvgId, now]
+    () =>
+      mapProgramsByChannel(
+        programs,
+        channelIdByTvgId,
+        offsetMinutesByChannelId,
+        displayWindowMs
+      ),
+    [
+      programs,
+      channelIdByTvgId,
+      offsetMinutesByChannelId,
+      displayWindowMs,
+      now,
+    ]
   );
 
   const recordingsByProgramId = useMemo(

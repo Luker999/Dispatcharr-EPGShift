@@ -17,7 +17,7 @@ from drf_spectacular.types import OpenApiTypes
 from django.db.models import Q
 from django.utils import timezone
 from django.utils.dateparse import parse_datetime
-from datetime import timedelta
+from datetime import datetime, timedelta
 from .models import EPGSource, ProgramData, EPGData
 from .serializers import (
     ProgramDataSerializer,
@@ -28,6 +28,7 @@ from .serializers import (
 )
 from .tasks import refresh_epg_data, find_current_program_for_tvg_id
 from .query_utils import parse_text_query
+from apps.channels.epg_offset import validate_epg_time_offset_minutes
 from apps.accounts.permissions import (
     Authenticated,
     IsAdmin,
@@ -402,6 +403,25 @@ class EPGGridAPIView(APIView):
         now = timezone.now()
         one_hour_ago = now - timedelta(hours=1)
         twenty_four_hours_later = now + timedelta(hours=24)
+
+        # Channels with epg_time_offset_minutes display source programs shifted
+        # in time; widen the source window by the largest |offset| so a shifted
+        # channel still covers its full displayed range.
+        from django.db.models import Max
+        from django.db.models.functions import Abs
+        from apps.channels.models import Channel
+
+        max_offset_minutes = (
+            Channel.objects.aggregate(
+                max_offset=Max(Abs("epg_time_offset_minutes"))
+            )["max_offset"]
+            or 0
+        )
+        if max_offset_minutes:
+            offset_padding = timedelta(minutes=max_offset_minutes)
+            one_hour_ago -= offset_padding
+            twenty_four_hours_later += offset_padding
+
         logger.debug(
             f"EPGGridAPIView: Querying programs between {one_hour_ago} and {twenty_four_hours_later}."
         )
@@ -412,7 +432,6 @@ class EPGGridAPIView(APIView):
         )
 
         # Generate dummy programs for channels that have no EPG data OR dummy EPG sources
-        from apps.channels.models import Channel
         from apps.epg.models import EPGSource
         from django.db.models import Q
 
@@ -743,6 +762,17 @@ class EPGDataViewSet(viewsets.ReadOnlyModelViewSet):
 # ─────────────────────────────
 # 6) Current Programs API
 # ─────────────────────────────
+def _shift_program_dict(program_data, offset):
+    """Shift a serialized program dict's start_time/end_time by *offset*."""
+    if not offset:
+        return program_data
+    for key in ("start_time", "end_time"):
+        value = program_data.get(key)
+        if value:
+            program_data[key] = (datetime.fromisoformat(value) + offset).isoformat()
+    return program_data
+
+
 class CurrentProgramsAPIView(APIView):
     """
     Lightweight endpoint that returns currently playing programs for specified channel IDs.
@@ -774,6 +804,15 @@ class CurrentProgramsAPIView(APIView):
                     allow_null=True,
                     help_text="Array of EPG data IDs. Can be used instead of channel_ids.",
                 ),
+                "time_offset_minutes": serializers.IntegerField(
+                    required=False,
+                    allow_null=True,
+                    help_text=(
+                        "Optional fixed offset in minutes applied to the lookup "
+                        "window and the returned program times (for channels "
+                        "with epg_time_offset_minutes set). Defaults to 0."
+                    ),
+                ),
             },
         ),
         responses={200: ProgramDataSerializer(many=True)},
@@ -792,6 +831,23 @@ class CurrentProgramsAPIView(APIView):
 
         # Get current time
         now = timezone.now()
+
+        # Optional fixed offset (minutes) applied to the lookup window and the
+        # returned program times; used by the channel editor preview for
+        # channels with epg_time_offset_minutes set. Absent/null/blank mean
+        # no shift; the shared ±1440 rule rejects anything else malformed.
+        raw_offset = request.data.get('time_offset_minutes')
+        try:
+            offset_minutes = validate_epg_time_offset_minutes(raw_offset)
+        except ValueError:
+            return Response(
+                {"error": "time_offset_minutes must be an integer between -1440 and 1440"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        offset = timedelta(minutes=offset_minutes or 0)
+        # A channel that airs `offset` later than the source shows, at real
+        # time `now`, what the source says is airing at `now - offset`.
+        lookup_now = now - offset
 
         # If epg_data_ids are provided, query directly by EPG data
         if epg_data_ids is not None:
@@ -818,7 +874,7 @@ class CurrentProgramsAPIView(APIView):
 
             # Batch-fetch current programs for all requested EPG entries in one query
             db_programs = ProgramData.objects.filter(
-                epg__in=epg_data_entries, start_time__lte=now, end_time__gt=now
+                epg__in=epg_data_entries, start_time__lte=lookup_now, end_time__gt=lookup_now
             ).select_related('epg')
             # Map epg_data id -> first matching program
             programs_by_epg = {}
@@ -832,7 +888,9 @@ class CurrentProgramsAPIView(APIView):
                 program = programs_by_epg.get(epg_data.id)
 
                 if program:
-                    program_data = ProgramDataSerializer(program).data
+                    program_data = _shift_program_dict(
+                        ProgramDataSerializer(program).data, offset
+                    )
                     program_data['epg_data_id'] = epg_data.id
                     current_programs.append(program_data)
                     continue
@@ -842,7 +900,7 @@ class CurrentProgramsAPIView(APIView):
                     continue
 
                 # Fall back to byte-offset index lookup, pass the object to avoid re-fetch
-                result = find_current_program_for_tvg_id(epg_data)
+                result = find_current_program_for_tvg_id(epg_data, as_of=lookup_now)
 
                 if result == "timeout":
                     current_programs.append({
@@ -850,6 +908,7 @@ class CurrentProgramsAPIView(APIView):
                         "parsing": True,
                     })
                 elif result is not None:
+                    result = _shift_program_dict(result, offset)
                     result['epg_data_id'] = epg_data.id
                     current_programs.append(result)
 
@@ -876,14 +935,21 @@ class CurrentProgramsAPIView(APIView):
         current_programs = []
 
         for channel in query:
+            # A channel with epg_time_offset_minutes airs that many minutes
+            # later than the source times: show the source program airing at
+            # `now - offset` with its times shifted back by the offset.
+            channel_offset = timedelta(minutes=channel.epg_time_offset_minutes or 0)
+            lookup_now = now - channel_offset
             program = ProgramData.objects.select_related("epg").filter(
                 epg_id=channel.effective_epg_data_id,
-                start_time__lte=now,
-                end_time__gt=now
+                start_time__lte=lookup_now,
+                end_time__gt=lookup_now
             ).first()
 
             if program:
-                program_data = ProgramDataSerializer(program).data
+                program_data = _shift_program_dict(
+                    ProgramDataSerializer(program).data, channel_offset
+                )
                 program_data['channel_uuid'] = str(channel.uuid)
                 current_programs.append(program_data)
 

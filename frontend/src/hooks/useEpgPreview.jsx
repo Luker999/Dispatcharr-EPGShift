@@ -1,11 +1,11 @@
 import { useEffect, useState } from 'react';
 import API from '../api';
 
-const getCurrentProgramForEpg = (epgId) => {
-  return API.getCurrentProgramForEpg(epgId);
+const getCurrentProgramForEpg = (epgId, timeOffsetMinutes) => {
+  return API.getCurrentProgramForEpg(epgId, timeOffsetMinutes);
 };
 
-export const useEpgPreview = (epgDataId) => {
+export const useEpgPreview = (epgDataId, timeOffsetMinutes) => {
   const [currentProgram, setCurrentProgram] = useState(null);
   const [isLoadingProgram, setIsLoadingProgram] = useState(false);
   const [hasFetchedProgram, setHasFetchedProgram] = useState(false);
@@ -32,7 +32,10 @@ export const useEpgPreview = (epgDataId) => {
         if (cancelled || Date.now() - startTime > deadlineMs) break;
 
         try {
-          const program = await getCurrentProgramForEpg(epgDataId);
+          const program = await getCurrentProgramForEpg(
+            epgDataId,
+            timeOffsetMinutes
+          );
           if (cancelled) return;
 
           if (program && program.parsing && attempt < maxRetries) {
@@ -70,7 +73,7 @@ export const useEpgPreview = (epgDataId) => {
     return () => {
       cancelled = true;
     };
-  }, [epgDataId]);
+  }, [epgDataId, timeOffsetMinutes]);
 
   return { currentProgram, isLoadingProgram, hasFetchedProgram };
 };
