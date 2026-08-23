@@ -7,12 +7,15 @@ Covers:
   - Edge cases: None inputs, zero-duration recording, no EPG data
   - Returned dict structure (id, title, sub_title, description)
 """
+import os
+import tempfile
 from datetime import timedelta
+from unittest.mock import patch
 
 from django.test import TestCase
 from django.utils import timezone
 
-from apps.channels.models import Channel
+from apps.channels.models import Channel, Recording
 from apps.epg.models import EPGSource, EPGData, ProgramData
 from apps.channels.tasks import _match_epg_program_by_timeslot
 
@@ -178,3 +181,271 @@ class EdgeCaseTests(EpgMatchingSetupMixin, TestCase):
             self.epg, self.base, self.base + timedelta(hours=1),
         )
         self.assertIsNone(result)
+
+
+class OffsetedTimeslotMatchingTests(EpgMatchingSetupMixin, TestCase):
+    """The offset_minutes parameter shifts the source EPG lookup.
+
+    The recording window passed in is the real airtime on the channel;
+    with a positive offset O the channel airs source programmes later, so
+    the source EPG is looked up at recording_time - O (and vice versa for
+    negative offsets).
+    """
+
+    def test_positive_offset_selects_program_actually_airing(self):
+        """O=+120: the real window aligns with the later source programme."""
+        # Source: "Show A" 0-60min, "Show B" 60-120min.
+        a = self._prog(0, 60, title="Show A")
+        b = self._prog(60, 60, title="Show B")
+        # B is airing on the channel during the real window 180-240min.
+        rec_start = self.base + timedelta(minutes=180)
+        rec_end = self.base + timedelta(minutes=240)
+        result = _match_epg_program_by_timeslot(
+            self.epg, rec_start, rec_end, offset_minutes=120,
+        )
+        self.assertIsNotNone(result)
+        self.assertEqual(result["id"], b.id)
+        self.assertEqual(result["title"], "Show B")
+        # An unshifted lookup of the same real window finds nothing.
+        self.assertIsNone(_match_epg_program_by_timeslot(self.epg, rec_start, rec_end))
+
+    def test_negative_offset_selects_program_actually_airing(self):
+        """O=-120: the real window aligns with the later source programme,
+        while an unshifted lookup would pick the earlier one."""
+        # Source: "Show A" 0-60min (real -120..-60), "Show B" 120-180min
+        # (real 0-60).
+        a = self._prog(0, 60, title="Show A")
+        b = self._prog(120, 60, title="Show B")
+        rec_start = self.base
+        rec_end = self.base + timedelta(minutes=60)
+        result = _match_epg_program_by_timeslot(
+            self.epg, rec_start, rec_end, offset_minutes=-120,
+        )
+        self.assertIsNotNone(result)
+        self.assertEqual(result["id"], b.id)
+        self.assertEqual(result["title"], "Show B")
+        # Unshifted, the same window would match Show A.
+        unshifted = _match_epg_program_by_timeslot(self.epg, rec_start, rec_end)
+        self.assertIsNotNone(unshifted)
+        self.assertEqual(unshifted["id"], a.id)
+
+    def test_null_and_zero_offsets_preserve_unshifted_lookup(self):
+        """offset_minutes=None (unset channel offset) and 0 are no-ops."""
+        prog = self._prog(0, 60, title="Plain Show")
+        for offset in (None, 0):
+            with self.subTest(offset=offset):
+                result = _match_epg_program_by_timeslot(
+                    self.epg, prog.start_time, prog.end_time, offset_minutes=offset,
+                )
+                self.assertIsNotNone(result)
+                self.assertEqual(result["id"], prog.id)
+
+    def test_positive_offset_exact_boundary_match(self):
+        """A real window exactly equal to source programme + O still matches."""
+        prog = self._prog(0, 60, title="Edge Show")
+        rec_start = prog.start_time + timedelta(minutes=90)
+        rec_end = prog.end_time + timedelta(minutes=90)
+        result = _match_epg_program_by_timeslot(
+            self.epg, rec_start, rec_end, offset_minutes=90,
+        )
+        self.assertIsNotNone(result)
+        self.assertEqual(result["id"], prog.id)
+
+
+@patch("apps.channels.signals.schedule_recording_task", return_value="mock-task-id")
+@patch("apps.channels.signals.prefetch_recording_artwork")
+class ManualEnrichmentCallPathTests(EpgMatchingSetupMixin, TestCase):
+    """Both manual-recording enrichment call paths (run_recording and
+    prefetch_recording_artwork) must shift the EPG lookup by the channel's
+    epg_time_offset_minutes so title/description/artwork enrichment selects
+    the programme actually airing on the delayed/advanced channel.
+    """
+
+    RATING_CP = {"rating": "PG-13", "rating_system": "MPAA"}
+
+    def setUp(self):
+        super().setUp()
+        # Channel offset saves in these tests must not enqueue a live
+        # reschedule (the post_save signal dispatches on offset changes).
+        self._reschedule_patcher = patch(
+            "apps.channels.tasks.reschedule_upcoming_recordings_for_offset_change"
+        )
+        self._reschedule_patcher.start()
+
+    def tearDown(self):
+        self._reschedule_patcher.stop()
+        super().tearDown()
+
+    def _set_channel_offset(self, minutes):
+        self.channel.epg_time_offset_minutes = minutes
+        self.channel.save()
+
+    def _prog_at(self, start, end, title="Test Show", **kwargs):
+        return ProgramData.objects.create(
+            epg=self.epg, start_time=start, end_time=end, title=title, **kwargs,
+        )
+
+    def _run_prefetch(self, rec):
+        from apps.channels.tasks import prefetch_recording_artwork
+        # The eager .apply() fires celery's task_prerun/task_postrun hooks,
+        # which call close_old_connections() and would drop the test's DB
+        # connection (see dispatcharr/celery.py).
+        with patch("django.db.close_old_connections"), \
+             patch("apps.channels.tasks.requests.get", side_effect=ConnectionError("offline")), \
+             patch("apps.channels.tasks._validate_url", return_value=False), \
+             patch("core.utils.send_websocket_update"):
+            prefetch_recording_artwork.apply(args=[rec.id])
+        rec.refresh_from_db()
+        return rec
+
+    def _run_recording_task(self, rec):
+        from apps.channels.tasks import run_recording
+        tmpdir = tempfile.mkdtemp(prefix="dvr-enrich-test-")
+        with patch("django.db.close_old_connections"), \
+             patch("apps.channels.tasks.async_to_sync", return_value=lambda *a, **k: None), \
+             patch(
+                 "apps.channels.tasks._build_output_paths",
+                 return_value=(
+                     os.path.join(tmpdir, "out.mkv"),
+                     os.path.join(tmpdir, "hls"),
+                     "out.mkv",
+                 ),
+             ), \
+             patch("apps.channels.tasks._resolve_poster_for_program", return_value=(None, None)), \
+             patch("core.utils.send_websocket_update"):
+            run_recording.apply(
+                args=[rec.id, rec.channel_id, rec.start_time.isoformat(), rec.end_time.isoformat()],
+            )
+        rec.refresh_from_db()
+        return rec
+
+    def _saved_program(self, rec):
+        return (rec.custom_properties or {}).get("program") or {}
+
+    def test_prefetch_positive_offset_enriches_from_shifted_lookup(
+        self, mock_prefetch_signal, mock_schedule,
+    ):
+        """prefetch_recording_artwork with O=+120 matches the source
+        programme airing in the real window, not the raw-time one."""
+        self._set_channel_offset(120)
+        # Source: "Show A" 0-60min, "Show B" 60-120min (B's real airing: 180-240).
+        self._prog(0, 60, title="Show A")
+        b = self._prog(60, 60, title="Show B", custom_properties=self.RATING_CP)
+        rec = Recording.objects.create(
+            channel=self.channel,
+            start_time=self.base + timedelta(minutes=180),
+            end_time=self.base + timedelta(minutes=240),
+            custom_properties={"program": {}},
+        )
+
+        rec = self._run_prefetch(rec)
+
+        prog = self._saved_program(rec)
+        self.assertEqual(prog.get("id"), b.id)
+        self.assertEqual(prog.get("title"), "Show B")
+        # Rating enrichment is keyed on the matched program id — proves the
+        # shifted lookup selected the right source programme.
+        self.assertEqual((rec.custom_properties or {}).get("rating"), "PG-13")
+
+    def test_prefetch_negative_offset_enriches_from_shifted_lookup(
+        self, mock_prefetch_signal, mock_schedule,
+    ):
+        """prefetch_recording_artwork with O=-120 matches the source
+        programme airing in the real window (an unshifted lookup would pick
+        the earlier source programme)."""
+        self._set_channel_offset(-120)
+        a = self._prog(0, 60, title="Show A")  # real airing: -120..-60min
+        b = self._prog(120, 60, title="Show B", custom_properties=self.RATING_CP)
+        rec = Recording.objects.create(
+            channel=self.channel,
+            start_time=self.base,
+            end_time=self.base + timedelta(minutes=60),
+            custom_properties={"program": {}},
+        )
+
+        rec = self._run_prefetch(rec)
+
+        prog = self._saved_program(rec)
+        self.assertEqual(prog.get("id"), b.id)
+        self.assertEqual(prog.get("title"), "Show B")
+        self.assertIsNotNone(a)  # the unshifted decoy must not have been picked
+        self.assertNotEqual(prog.get("title"), a.title)
+
+    def test_prefetch_null_offset_preserves_unshifted_enrichment(
+        self, mock_prefetch_signal, mock_schedule,
+    ):
+        """Offset null: the lookup window is used as-is."""
+        self.assertIsNone(self.channel.epg_time_offset_minutes)
+        # Rating forces the enriched program to be persisted (the prefetch
+        # task only saves when some enrichment field changed).
+        prog = self._prog(0, 60, title="Plain Show", custom_properties=self.RATING_CP)
+        rec = Recording.objects.create(
+            channel=self.channel,
+            start_time=prog.start_time,
+            end_time=prog.end_time,
+            custom_properties={"program": {}},
+        )
+
+        rec = self._run_prefetch(rec)
+
+        saved = self._saved_program(rec)
+        self.assertEqual(saved.get("id"), prog.id)
+        self.assertEqual(saved.get("title"), "Plain Show")
+        self.assertEqual((rec.custom_properties or {}).get("rating"), "PG-13")
+
+    def test_run_recording_positive_offset_enriches_saved_program(
+        self, mock_prefetch_signal, mock_schedule,
+    ):
+        """run_recording with O=+120 enriches the persisted program from the
+        source programme actually airing in the (past) real window."""
+        self._set_channel_offset(120)
+        # Past real window so the task exits before starting the stream.
+        real_start = timezone.now() - timedelta(hours=5)
+        real_end = real_start + timedelta(hours=1)
+        # B is the programme airing during the real window (source = real - 120).
+        b = self._prog_at(
+            real_start - timedelta(minutes=120), real_end - timedelta(minutes=120),
+            title="Delayed Show",
+        )
+        # A sits at the raw real-window times: an unshifted lookup would pick it.
+        self._prog_at(real_start, real_end, title="Wrong Show")
+        rec = Recording.objects.create(
+            channel=self.channel,
+            start_time=real_start,
+            end_time=real_end,
+            custom_properties={"program": {}},
+        )
+
+        rec = self._run_recording_task(rec)
+
+        prog = self._saved_program(rec)
+        self.assertEqual(prog.get("id"), b.id)
+        self.assertEqual(prog.get("title"), "Delayed Show")
+
+    def test_run_recording_negative_offset_enriches_saved_program(
+        self, mock_prefetch_signal, mock_schedule,
+    ):
+        """run_recording with O=-120 enriches the persisted program from the
+        source programme actually airing in the (past) real window."""
+        self._set_channel_offset(-120)
+        real_start = timezone.now() - timedelta(hours=5)
+        real_end = real_start + timedelta(hours=1)
+        # B is the programme airing during the real window (source = real + 120).
+        b = self._prog_at(
+            real_start + timedelta(minutes=120), real_end + timedelta(minutes=120),
+            title="Advanced Show",
+        )
+        # A sits at the raw real-window times: an unshifted lookup would pick it.
+        self._prog_at(real_start, real_end, title="Wrong Show")
+        rec = Recording.objects.create(
+            channel=self.channel,
+            start_time=real_start,
+            end_time=real_end,
+            custom_properties={"program": {}},
+        )
+
+        rec = self._run_recording_task(rec)
+
+        prog = self._saved_program(rec)
+        self.assertEqual(prog.get("id"), b.id)
+        self.assertEqual(prog.get("title"), "Advanced Show")

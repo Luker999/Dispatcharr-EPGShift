@@ -1225,6 +1225,20 @@ class ChannelViewSet(viewsets.ModelViewSet):
                 cid = channel_data.get("id")
                 override_intents[cid] = channel_data["override"]
 
+        # Capture EPG offset transitions before setattr overwrites the
+        # in-memory channels. bulk_update skips post_save, so the
+        # recording reschedule the post_save signal triggers for
+        # single-row saves runs explicitly below.  None and 0 are
+        # equivalent (no shift), so toggling between them does not
+        # reschedule.
+        offset_change_ids = [
+            channel.id
+            for channel, validated_data in validated_updates
+            if "epg_time_offset_minutes" in validated_data
+            and (validated_data["epg_time_offset_minutes"] or 0)
+            != (channel.epg_time_offset_minutes or 0)
+        ]
+
         # Capture hide / unhide transitions before setattr overwrites
         # the in-memory channels. bulk_update skips post_save, so the
         # compact-mode assign / release runs explicitly below.
@@ -1303,6 +1317,22 @@ class ChannelViewSet(viewsets.ModelViewSet):
                     for ch in channels_to_update:
                         if ch.id in ids_to_release:
                             ch.channel_number = None
+
+            # A channel's EPG time offset changed: future not-yet-started
+            # EPG-based recordings must move to the programme's new real
+            # airtime.  The post_save signal handles single-row saves; the
+            # bulk path dispatches explicitly.
+            if offset_change_ids:
+                try:
+                    from .tasks import (
+                        reschedule_upcoming_recordings_for_offset_change,
+                    )
+                    reschedule_upcoming_recordings_for_offset_change.delay()
+                except Exception:
+                    from .tasks import (
+                        reschedule_upcoming_recordings_for_offset_change_impl,
+                    )
+                    reschedule_upcoming_recordings_for_offset_change_impl()
 
             # Override (reverse OneToOne) needs a separate write path.
             if override_intents:

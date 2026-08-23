@@ -834,3 +834,718 @@ class TitleOnlyRuleTests(SeriesRuleDedupBaseTestCase):
         result = evaluate_series_rules_impl()
         self.assertEqual(result["scheduled"], 0)
         self.assertEqual(Recording.objects.count(), 0)
+
+
+# ---------------------------------------------------------------------------
+# Series rule EPG time offset: real-airtime filtering, dedup and storage
+# ---------------------------------------------------------------------------
+
+@patch("apps.channels.tasks.prefetch_recording_artwork")
+@patch("apps.channels.signals.schedule_recording_task", return_value="mock-task-id")
+class SeriesRuleOffsetTests(SeriesRuleDedupBaseTestCase):
+    """Series rule evaluation honours Channel.epg_time_offset_minutes.
+
+    A positive offset O means the channel airs the source programme later:
+    real_start = source_start + O, real_end = source_end + O.  All fixtures
+    are anchored to a frozen clock so now/horizon boundaries are exact.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.frozen_now = timezone.now().replace(microsecond=0)
+        self.horizon = self.frozen_now + timedelta(days=7)
+        # Channel offset saves in these tests must not enqueue a live
+        # reschedule (the post_save signal dispatches on offset changes).
+        self._reschedule_patcher = patch(
+            "apps.channels.tasks.reschedule_upcoming_recordings_for_offset_change"
+        )
+        self._reschedule_patcher.start()
+
+    def tearDown(self):
+        self._reschedule_patcher.stop()
+        super().tearDown()
+
+    def _set_channel_offset(self, minutes):
+        self.channel.epg_time_offset_minutes = minutes
+        self.channel.save()
+
+    def _prog(self, start, end, title="Test Show", sub_title="Episode 1",
+              tvg_id="test.channel.1", epg=None):
+        return ProgramData.objects.create(
+            epg=epg or self.epg, tvg_id=tvg_id, start_time=start, end_time=end,
+            title=title, sub_title=sub_title,
+        )
+
+    def _eval(self):
+        from apps.channels.tasks import evaluate_series_rules_impl
+        with patch("django.utils.timezone.now", return_value=self.frozen_now):
+            return evaluate_series_rules_impl()
+
+    @patch("apps.channels.tasks.acquire_task_lock", return_value=True)
+    @patch("apps.channels.tasks.release_task_lock")
+    def test_positive_offset_program_ended_recently_is_scheduled(
+        self, mock_release, mock_lock, mock_schedule, mock_artwork
+    ):
+        """O=+120: a source programme that ended 60 minutes ago has its real
+        end 60 minutes in the future — it must be scheduled, not dropped by
+        a raw end_time > now fetch/filter."""
+        self._set_channel_offset(120)
+        self._prog(
+            start=self.frozen_now - timedelta(minutes=180),
+            end=self.frozen_now - timedelta(minutes=60),
+        )
+
+        result = self._eval()
+        self.assertEqual(result["scheduled"], 1)
+        rec = Recording.objects.get()
+        self.assertEqual(rec.start_time, self.frozen_now - timedelta(minutes=60))
+        self.assertEqual(rec.end_time, self.frozen_now + timedelta(minutes=60))
+
+    @patch("apps.channels.tasks.acquire_task_lock", return_value=True)
+    @patch("apps.channels.tasks.release_task_lock")
+    def test_negative_offset_program_past_raw_horizon_is_scheduled(
+        self, mock_release, mock_lock, mock_schedule, mock_artwork
+    ):
+        """O=-120: a source programme starting 60 minutes after the raw
+        horizon has its real start 60 minutes before it — it must be
+        scheduled, not dropped by a raw start_time <= horizon filter."""
+        self._set_channel_offset(-120)
+        self._prog(
+            start=self.horizon + timedelta(minutes=60),
+            end=self.horizon + timedelta(minutes=120),
+        )
+
+        result = self._eval()
+        self.assertEqual(result["scheduled"], 1)
+        rec = Recording.objects.get()
+        self.assertEqual(rec.start_time, self.horizon - timedelta(minutes=60))
+        self.assertEqual(rec.end_time, self.horizon)
+
+    @patch("apps.channels.tasks.acquire_task_lock", return_value=True)
+    @patch("apps.channels.tasks.release_task_lock")
+    def test_shifted_real_end_at_now_excluded(
+        self, mock_release, mock_lock, mock_schedule, mock_artwork
+    ):
+        """A programme whose shifted real end is exactly at now is over:
+        the filter is strictly real_end > now."""
+        self._set_channel_offset(120)
+        self._prog(
+            start=self.frozen_now - timedelta(minutes=300),
+            end=self.frozen_now - timedelta(minutes=120),  # real end == now
+        )
+
+        result = self._eval()
+        self.assertEqual(result["scheduled"], 0)
+        self.assertEqual(Recording.objects.count(), 0)
+
+    @patch("apps.channels.tasks.acquire_task_lock", return_value=True)
+    @patch("apps.channels.tasks.release_task_lock")
+    def test_shifted_real_end_before_now_excluded(
+        self, mock_release, mock_lock, mock_schedule, mock_artwork
+    ):
+        """A programme whose shifted real end is before now is excluded."""
+        self._set_channel_offset(120)
+        self._prog(
+            start=self.frozen_now - timedelta(minutes=301),
+            end=self.frozen_now - timedelta(minutes=121),  # real end < now
+        )
+
+        result = self._eval()
+        self.assertEqual(result["scheduled"], 0)
+        self.assertEqual(Recording.objects.count(), 0)
+
+    @patch("apps.channels.tasks.acquire_task_lock", return_value=True)
+    @patch("apps.channels.tasks.release_task_lock")
+    def test_shifted_real_start_after_horizon_excluded(
+        self, mock_release, mock_lock, mock_schedule, mock_artwork
+    ):
+        """O=+120: a programme whose source start is inside the widened fetch
+        window but whose shifted real start is after the horizon is excluded
+        by the exact filter (real_start <= horizon)."""
+        self._set_channel_offset(120)
+        self._prog(
+            start=self.horizon - timedelta(minutes=119),  # real start == horizon + 1
+            end=self.horizon - timedelta(minutes=59),     # real end == horizon + 61
+        )
+
+        result = self._eval()
+        self.assertEqual(result["scheduled"], 0)
+        self.assertEqual(Recording.objects.count(), 0)
+
+    @patch("apps.channels.tasks.acquire_task_lock", return_value=True)
+    @patch("apps.channels.tasks.release_task_lock")
+    def test_shifted_real_start_at_horizon_included(
+        self, mock_release, mock_lock, mock_schedule, mock_artwork
+    ):
+        """The horizon filter is inclusive: real_start <= horizon."""
+        self._set_channel_offset(-120)
+        self._prog(
+            start=self.horizon + timedelta(minutes=120),  # real start == horizon
+            end=self.horizon + timedelta(minutes=180),
+        )
+
+        result = self._eval()
+        self.assertEqual(result["scheduled"], 1)
+        rec = Recording.objects.get()
+        self.assertEqual(rec.start_time, self.horizon)
+
+    @patch("apps.channels.tasks.acquire_task_lock", return_value=True)
+    @patch("apps.channels.tasks.release_task_lock")
+    def test_null_offset_preserves_unshifted_behaviour(
+        self, mock_release, mock_lock, mock_schedule, mock_artwork
+    ):
+        """Offset null: programs are scheduled and stored at raw source times."""
+        self.assertIsNone(self.channel.epg_time_offset_minutes)
+        self._prog(
+            start=self.frozen_now + timedelta(hours=2),
+            end=self.frozen_now + timedelta(hours=3),
+        )
+
+        result = self._eval()
+        self.assertEqual(result["scheduled"], 1)
+        rec = Recording.objects.get()
+        self.assertEqual(rec.start_time, self.frozen_now + timedelta(hours=2))
+        self.assertEqual(rec.end_time, self.frozen_now + timedelta(hours=3))
+        prog = rec.custom_properties["program"]
+        self.assertEqual(prog["start_time"], (self.frozen_now + timedelta(hours=2)).isoformat())
+        self.assertEqual(prog["end_time"], (self.frozen_now + timedelta(hours=3)).isoformat())
+
+    @patch("apps.channels.tasks.acquire_task_lock", return_value=True)
+    @patch("apps.channels.tasks.release_task_lock")
+    def test_zero_offset_preserves_unshifted_behaviour(
+        self, mock_release, mock_lock, mock_schedule, mock_artwork
+    ):
+        """Offset 0: identical to no offset."""
+        self._set_channel_offset(0)
+        self._prog(
+            start=self.frozen_now + timedelta(hours=2),
+            end=self.frozen_now + timedelta(hours=3),
+        )
+
+        result = self._eval()
+        self.assertEqual(result["scheduled"], 1)
+        rec = Recording.objects.get()
+        self.assertEqual(rec.start_time, self.frozen_now + timedelta(hours=2))
+        self.assertEqual(rec.end_time, self.frozen_now + timedelta(hours=3))
+
+    @patch("apps.channels.tasks.acquire_task_lock", return_value=True)
+    @patch("apps.channels.tasks.release_task_lock")
+    def test_program_past_horizon_excluded_with_null_offset(
+        self, mock_release, mock_lock, mock_schedule, mock_artwork
+    ):
+        """Negative case without offset: a programme beyond the horizon is
+        excluded (guards against the widened fetch over-scheduling)."""
+        self._prog(
+            start=self.horizon + timedelta(minutes=1),
+            end=self.horizon + timedelta(hours=2),
+        )
+
+        result = self._eval()
+        self.assertEqual(result["scheduled"], 0)
+        self.assertEqual(Recording.objects.count(), 0)
+
+    @patch("apps.channels.tasks.acquire_task_lock", return_value=True)
+    @patch("apps.channels.tasks.release_task_lock")
+    def test_negative_offset_upcoming_program_scheduled_at_real_start(
+        self, mock_release, mock_lock, mock_schedule, mock_artwork
+    ):
+        """O=-120 (channel airs earlier): a future source programme is
+        recorded at its shifted real start."""
+        self._set_channel_offset(-120)
+        source_start = self.frozen_now + timedelta(hours=4)
+        self._prog(start=source_start, end=source_start + timedelta(hours=1))
+
+        result = self._eval()
+        self.assertEqual(result["scheduled"], 1)
+        rec = Recording.objects.get()
+        self.assertEqual(rec.start_time, source_start - timedelta(minutes=120))
+        self.assertEqual(rec.end_time, source_start + timedelta(hours=1) - timedelta(minutes=120))
+
+    @patch("apps.channels.tasks.acquire_task_lock", return_value=True)
+    @patch("apps.channels.tasks.release_task_lock")
+    def test_stored_program_times_are_real_airtimes(
+        self, mock_release, mock_lock, mock_schedule, mock_artwork
+    ):
+        """custom_properties.program stores shifted real airtimes while
+        preserving the original source programme id and metadata."""
+        self._set_channel_offset(120)
+        source_start = self.frozen_now + timedelta(hours=2)
+        source_end = source_start + timedelta(hours=1)
+        prog = self._prog(
+            start=source_start, end=source_end,
+            title="Test Show", sub_title="Episode 7",
+        )
+
+        self._eval()
+        rec = Recording.objects.get()
+        self.assertEqual(rec.start_time, source_start + timedelta(minutes=120))
+        self.assertEqual(rec.end_time, source_end + timedelta(minutes=120))
+
+        p = rec.custom_properties["program"]
+        self.assertEqual(p["id"], prog.id)
+        self.assertEqual(p["tvg_id"], "test.channel.1")
+        self.assertEqual(p["title"], "Test Show")
+        self.assertEqual(p["sub_title"], "Episode 7")
+        self.assertEqual(p["start_time"], (source_start + timedelta(minutes=120)).isoformat())
+        self.assertEqual(p["end_time"], (source_end + timedelta(minutes=120)).isoformat())
+
+    @patch("apps.channels.tasks.acquire_task_lock", return_value=True)
+    @patch("apps.channels.tasks.release_task_lock")
+    def test_padding_applied_to_real_airtimes(
+        self, mock_release, mock_lock, mock_schedule, mock_artwork
+    ):
+        """DVR pre/post padding wraps the real airtimes, not the source ones:
+        adj_start = source_start + O - pre, adj_end = source_end + O + post."""
+        self._set_channel_offset(120)
+        _set_dvr_offsets(pre_min=5, post_min=10)
+        source_start = self.frozen_now + timedelta(hours=2)
+        source_end = source_start + timedelta(hours=1)
+        self._prog(start=source_start, end=source_end)
+
+        result = self._eval()
+        self.assertEqual(result["scheduled"], 1)
+        rec = Recording.objects.get()
+        real_start = source_start + timedelta(minutes=120)
+        real_end = source_end + timedelta(minutes=120)
+        self.assertEqual(rec.start_time, real_start - timedelta(minutes=5))
+        self.assertEqual(rec.end_time, real_end + timedelta(minutes=10))
+
+    @patch("apps.channels.tasks.acquire_task_lock", return_value=True)
+    @patch("apps.channels.tasks.release_task_lock")
+    def test_shifted_dedup_against_guide_created_recording(
+        self, mock_release, mock_lock, mock_schedule, mock_artwork
+    ):
+        """A recording created from the shifted guide stores real airtimes in
+        custom_properties.program; re-evaluating the series rule must not
+        create a duplicate for the same airing."""
+        self._set_channel_offset(120)
+        source_start = self.frozen_now + timedelta(hours=2)
+        source_end = source_start + timedelta(hours=1)
+        self._prog(start=source_start, end=source_end)
+
+        real_start = source_start + timedelta(minutes=120)
+        real_end = source_end + timedelta(minutes=120)
+        Recording.objects.create(
+            channel=self.channel,
+            start_time=real_start,
+            end_time=real_end,
+            custom_properties={
+                "program": {
+                    "id": 999999,  # guide program id; may differ from current
+                    "tvg_id": "test.channel.1",
+                    "title": "Test Show",
+                    "sub_title": "Episode 1",
+                    "start_time": real_start.isoformat(),
+                    "end_time": real_end.isoformat(),
+                }
+            },
+        )
+
+        result = self._eval()
+        self.assertEqual(result["scheduled"], 0)
+        self.assertEqual(Recording.objects.count(), 1)
+
+    @patch("apps.channels.tasks.acquire_task_lock", return_value=True)
+    @patch("apps.channels.tasks.release_task_lock")
+    def test_dedup_after_epg_refresh_with_offset(
+        self, mock_release, mock_lock, mock_schedule, mock_artwork
+    ):
+        """Dedup still works across EPG refreshes when the channel offset is
+        set (real airtimes are stable, ProgramData.id is not)."""
+        self._set_channel_offset(120)
+        source_start = self.frozen_now + timedelta(hours=2)
+        self._prog(start=source_start, end=source_start + timedelta(hours=1))
+
+        from apps.channels.tasks import evaluate_series_rules_impl
+        with patch("django.utils.timezone.now", return_value=self.frozen_now):
+            evaluate_series_rules_impl()
+        self.assertEqual(Recording.objects.count(), 1)
+
+        # EPG refresh: same source airtimes, new program IDs.
+        ProgramData.objects.filter(epg=self.epg).delete()
+        self._prog(start=source_start, end=source_start + timedelta(hours=1))
+
+        result = self._eval()
+        self.assertEqual(result["scheduled"], 0)
+        self.assertEqual(Recording.objects.count(), 1)
+
+    @patch("apps.channels.tasks.acquire_task_lock", return_value=True)
+    @patch("apps.channels.tasks.release_task_lock")
+    def test_earliest_airing_uses_shifted_real_start_times(
+        self, mock_release, mock_lock, mock_schedule, mock_artwork
+    ):
+        """Same episode airing on two channels with different offsets: the
+        earliest airing is decided by shifted real start times, not raw
+        source start times."""
+        _set_series_rules([{
+            "tvg_id": "",
+            "mode": "all",
+            "title": "Shifted Show",
+        }])
+        self._set_channel_offset(120)  # base channel chA (epg 1) airs late
+        epg2 = EPGData.objects.create(
+            tvg_id="series.show", name="Series EPG 2", epg_source=self.epg_source,
+        )
+        chB = Channel.objects.create(
+            channel_number=2, name="Test Channel 2",
+            epg_data=epg2, epg_time_offset_minutes=0,
+        )
+
+        # chA airs the episode 2h early in source time (+120 -> real 4h),
+        # chB at source 3h (== real 3h).  Raw-earliest is chA; the real
+        # earliest is chB, so chB must be recorded.
+        self._prog(
+            start=self.frozen_now + timedelta(hours=2),
+            end=self.frozen_now + timedelta(hours=3),
+            title="Shifted Show", sub_title="Episode 1", tvg_id="series.show",
+        )
+        self._prog(
+            start=self.frozen_now + timedelta(hours=3),
+            end=self.frozen_now + timedelta(hours=4),
+            title="Shifted Show", sub_title="Episode 1", tvg_id="series.show",
+            epg=epg2,
+        )
+
+        result = self._eval()
+        self.assertEqual(result["scheduled"], 1)
+        rec = Recording.objects.get()
+        self.assertEqual(rec.channel, chB)
+        self.assertEqual(rec.start_time, self.frozen_now + timedelta(hours=3))
+        self.assertEqual(rec.end_time, self.frozen_now + timedelta(hours=4))
+
+
+# ---------------------------------------------------------------------------
+# Offset-change rescheduling must not double-apply the channel EPG offset
+# ---------------------------------------------------------------------------
+
+@patch("apps.channels.tasks.prefetch_recording_artwork")
+@patch("apps.channels.signals.schedule_recording_task", return_value="mock-task-id")
+class OffsetRescheduleRegressionTests(SeriesRuleDedupBaseTestCase):
+    """reschedule_upcoming_recordings_for_offset_change derives the schedule
+    from the source ProgramData row plus the channel's current EPG offset
+    and applies only the DVR pre/post padding — the channel EPG offset must
+    not be applied a second time."""
+
+    def setUp(self):
+        super().setUp()
+        self._reschedule_patcher = patch(
+            "apps.channels.tasks.reschedule_upcoming_recordings_for_offset_change"
+        )
+        self._reschedule_patcher.start()
+
+    def tearDown(self):
+        self._reschedule_patcher.stop()
+        super().tearDown()
+
+    @patch("apps.channels.tasks.acquire_task_lock", return_value=True)
+    @patch("apps.channels.tasks.release_task_lock")
+    def test_reschedule_after_dvr_offset_change_applies_channel_offset_once(
+        self, mock_release, mock_lock, mock_schedule, mock_artwork
+    ):
+        from apps.channels.tasks import (
+            evaluate_series_rules_impl,
+            reschedule_upcoming_recordings_for_offset_change_impl,
+        )
+
+        self.channel.epg_time_offset_minutes = 120
+        self.channel.save()
+        _set_dvr_offsets(pre_min=5, post_min=5)
+
+        source_start = self.now + timedelta(hours=2)
+        source_end = source_start + timedelta(hours=1)
+        ProgramData.objects.create(
+            epg=self.epg, tvg_id="test.channel.1",
+            start_time=source_start, end_time=source_end,
+            title="Test Show", sub_title="Episode 1",
+        )
+        evaluate_series_rules_impl()
+        rec = Recording.objects.get()
+        real_start = source_start + timedelta(minutes=120)
+        real_end = source_end + timedelta(minutes=120)
+        self.assertEqual(rec.start_time, real_start - timedelta(minutes=5))
+        self.assertEqual(rec.end_time, real_end + timedelta(minutes=5))
+
+        # Change the DVR pre/post offsets and run the reschedule path.
+        _set_dvr_offsets(pre_min=10, post_min=15)
+        rescheduled = reschedule_upcoming_recordings_for_offset_change_impl()
+        rec.refresh_from_db()
+        # Offset applied exactly once: real airtimes + new padding only.
+        self.assertEqual(rec.start_time, real_start - timedelta(minutes=10))
+        self.assertEqual(rec.end_time, real_end + timedelta(minutes=15))
+        self.assertEqual(Recording.objects.count(), 1)
+        self.assertGreaterEqual(rescheduled["changed"], 1)
+
+        # A second reschedule run is a no-op (no drift / double application).
+        reschedule_upcoming_recordings_for_offset_change_impl()
+        rec.refresh_from_db()
+        self.assertEqual(rec.start_time, real_start - timedelta(minutes=10))
+        self.assertEqual(rec.end_time, real_end + timedelta(minutes=15))
+
+
+# ---------------------------------------------------------------------------
+# Channel EPG offset changes: reschedule from the source programme, never
+# from the already-shifted stored times
+# ---------------------------------------------------------------------------
+
+@patch("apps.channels.tasks.prefetch_recording_artwork")
+@patch("apps.channels.signals.schedule_recording_task", return_value="mock-task-id")
+@patch("apps.channels.tasks.reschedule_upcoming_recordings_for_offset_change")
+class OffsetChangeRescheduleTests(SeriesRuleDedupBaseTestCase):
+    """When Channel.epg_time_offset_minutes changes, future not-yet-started
+    recordings must move to the source programme's new real airtime:
+    new_real = source + current offset, with DVR padding applied after.
+    The stored (already shifted) times must never be used as the shift base.
+    """
+
+    def _make_source_and_rec(self, source_start, source_end, offset, status=""):
+        """Create a source programme plus an EPG-based recording exactly as
+        the series-rule engine (or the guide) stores it under `offset`:
+        recording at the real airtimes, program dict carrying the source id
+        and the real (shifted) airtimes."""
+        prog = ProgramData.objects.create(
+            epg=self.epg, tvg_id="test.channel.1",
+            start_time=source_start, end_time=source_end,
+            title="Test Show", sub_title="Episode 1",
+        )
+        real_start = source_start + timedelta(minutes=offset)
+        real_end = source_end + timedelta(minutes=offset)
+        cp = {
+            "program": {
+                "id": prog.id,
+                "tvg_id": "test.channel.1",
+                "title": "Test Show",
+                "sub_title": "Episode 1",
+                "start_time": real_start.isoformat(),
+                "end_time": real_end.isoformat(),
+            }
+        }
+        if status:
+            cp["status"] = status
+        rec = Recording.objects.create(
+            channel=self.channel,
+            start_time=real_start,
+            end_time=real_end,
+            custom_properties=cp,
+        )
+        return prog, rec
+
+    def _set_channel_offset(self, minutes):
+        self.channel.epg_time_offset_minutes = minutes
+        self.channel.save()
+
+    def _reschedule(self):
+        from apps.channels.tasks import (
+            reschedule_upcoming_recordings_for_offset_change_impl,
+        )
+        return reschedule_upcoming_recordings_for_offset_change_impl()
+
+    def test_offset_increase_moves_recording_by_delta_only(
+        self, mock_reschedule, mock_schedule, mock_artwork
+    ):
+        """+120 -> +180 moves the recording by exactly +60 minutes, to
+        source + 180."""
+        source_start = self.now + timedelta(hours=2)
+        source_end = source_start + timedelta(hours=1)
+        prog, rec = self._make_source_and_rec(source_start, source_end, 120)
+        old_start, old_end = rec.start_time, rec.end_time
+
+        self._set_channel_offset(180)
+        result = self._reschedule()
+        rec.refresh_from_db()
+
+        new_real_start = source_start + timedelta(minutes=180)
+        new_real_end = source_end + timedelta(minutes=180)
+        self.assertEqual(result["changed"], 1)
+        self.assertEqual(rec.start_time, new_real_start)
+        self.assertEqual(rec.end_time, new_real_end)
+        self.assertEqual(rec.start_time, old_start + timedelta(minutes=60))
+        self.assertEqual(rec.end_time, old_end + timedelta(minutes=60))
+        # Stored program carries the new real airtimes, original id kept.
+        p = rec.custom_properties["program"]
+        self.assertEqual(p["id"], prog.id)
+        self.assertEqual(p["tvg_id"], "test.channel.1")
+        self.assertEqual(p["title"], "Test Show")
+        self.assertEqual(p["sub_title"], "Episode 1")
+        self.assertEqual(p["start_time"], new_real_start.isoformat())
+        self.assertEqual(p["end_time"], new_real_end.isoformat())
+
+    def test_offset_to_zero_and_null_restores_source_airtime(
+        self, mock_reschedule, mock_schedule, mock_artwork
+    ):
+        """+120 -> 0 and +120 -> None both restore the source airtime."""
+        for target in (0, None):
+            with self.subTest(target=target):
+                source_start = self.now + timedelta(hours=2)
+                source_end = source_start + timedelta(hours=1)
+                prog, rec = self._make_source_and_rec(source_start, source_end, 120)
+
+                self._set_channel_offset(target)
+                result = self._reschedule()
+                rec.refresh_from_db()
+
+                self.assertEqual(result["changed"], 1)
+                self.assertEqual(rec.start_time, source_start)
+                self.assertEqual(rec.end_time, source_end)
+                p = rec.custom_properties["program"]
+                self.assertEqual(p["start_time"], source_start.isoformat())
+                self.assertEqual(p["end_time"], source_end.isoformat())
+
+    def test_negative_to_positive_offset_calculates_from_source_time(
+        self, mock_reschedule, mock_schedule, mock_artwork
+    ):
+        """-120 -> +180 is computed from the source time; adding the new
+        offset to the stored (already shifted) times would give a different,
+        wrong result."""
+        # Source starts 4h out so the -120 real start stays comfortably in
+        # the future (the reschedule only touches recordings whose start is
+        # after now).
+        source_start = self.now + timedelta(hours=4)
+        source_end = source_start + timedelta(hours=1)
+        prog, rec = self._make_source_and_rec(source_start, source_end, -120)
+        self.assertEqual(rec.start_time, source_start - timedelta(minutes=120))
+
+        self._set_channel_offset(180)
+        result = self._reschedule()
+        rec.refresh_from_db()
+
+        self.assertEqual(result["changed"], 1)
+        self.assertEqual(rec.start_time, source_start + timedelta(minutes=180))
+        self.assertEqual(rec.end_time, source_end + timedelta(minutes=180))
+        # The double-shifted value (old real start + new offset) must not
+        # have been produced.
+        self.assertNotEqual(
+            rec.start_time, source_start - timedelta(minutes=120) + timedelta(minutes=180)
+        )
+
+    def test_repeated_reschedule_is_idempotent(
+        self, mock_reschedule, mock_schedule, mock_artwork
+    ):
+        """Running the reschedule twice with the same current offset is a
+        no-op the second time."""
+        source_start = self.now + timedelta(hours=2)
+        source_end = source_start + timedelta(hours=1)
+        prog, rec = self._make_source_and_rec(source_start, source_end, 120)
+
+        self._set_channel_offset(180)
+        first = self._reschedule()
+        rec.refresh_from_db()
+        start_after, end_after = rec.start_time, rec.end_time
+        cp_after = dict(rec.custom_properties["program"])
+        self.assertEqual(first["changed"], 1)
+
+        second = self._reschedule()
+        rec.refresh_from_db()
+        self.assertEqual(second["changed"], 0)
+        self.assertEqual(rec.start_time, start_after)
+        self.assertEqual(rec.end_time, end_after)
+        self.assertEqual(rec.custom_properties["program"], cp_after)
+
+    def test_missing_source_program_preserved_and_reported(
+        self, mock_reschedule, mock_schedule, mock_artwork
+    ):
+        """If the source ProgramData row is gone (EPG refresh), the
+        recording is preserved untouched and the fallback is reported."""
+        source_start = self.now + timedelta(hours=2)
+        source_end = source_start + timedelta(hours=1)
+        prog, rec = self._make_source_and_rec(source_start, source_end, 120)
+        start_before, end_before = rec.start_time, rec.end_time
+
+        prog.delete()  # simulate EPG refresh replacing the row
+        self._set_channel_offset(180)
+        result = self._reschedule()
+        rec.refresh_from_db()
+
+        self.assertEqual(result["missing_programs"], 1)
+        self.assertEqual(result["changed"], 0)
+        self.assertEqual(rec.start_time, start_before)
+        self.assertEqual(rec.end_time, end_before)
+        self.assertEqual(
+            rec.custom_properties["program"]["start_time"], start_before.isoformat()
+        )
+        self.assertEqual(
+            rec.custom_properties["program"]["end_time"], end_before.isoformat()
+        )
+
+    def test_active_and_terminal_recordings_excluded(
+        self, mock_reschedule, mock_schedule, mock_artwork
+    ):
+        """Active (recording) and terminal (completed/interrupted) recordings
+        are never modified; only the pending recording moves."""
+        source_start = self.now + timedelta(hours=2)
+        source_end = source_start + timedelta(hours=1)
+        prog, pending = self._make_source_and_rec(source_start, source_end, 120)
+
+        protected = {}
+        for i, status in enumerate(("recording", "completed", "interrupted")):
+            start = self.now + timedelta(hours=4 + i)
+            _, rec = self._make_source_and_rec(
+                start, start + timedelta(hours=1), 120, status=status
+            )
+            protected[status] = (rec, start)
+
+        self._set_channel_offset(180)
+        result = self._reschedule()
+        pending.refresh_from_db()
+
+        self.assertEqual(result["changed"], 1)
+        self.assertEqual(pending.start_time, source_start + timedelta(minutes=180))
+        self.assertEqual(pending.end_time, source_end + timedelta(minutes=180))
+        for status, (rec, start) in protected.items():
+            rec.refresh_from_db()
+            with self.subTest(status=status):
+                self.assertEqual(rec.start_time, start + timedelta(minutes=120))
+                self.assertEqual(
+                    rec.end_time, start + timedelta(hours=1) + timedelta(minutes=120)
+                )
+                self.assertEqual(
+                    rec.custom_properties["program"]["start_time"],
+                    (start + timedelta(minutes=120)).isoformat(),
+                )
+
+    def test_padding_applied_after_new_real_airtime(
+        self, mock_reschedule, mock_schedule, mock_artwork
+    ):
+        """DVR pre/post padding wraps the new real airtimes, and the stored
+        program times are the un-padded real airtimes."""
+        _set_dvr_offsets(pre_min=5, post_min=10)
+        source_start = self.now + timedelta(hours=2)
+        source_end = source_start + timedelta(hours=1)
+        prog, rec = self._make_source_and_rec(source_start, source_end, 120)
+
+        self._set_channel_offset(180)
+        result = self._reschedule()
+        rec.refresh_from_db()
+
+        real_start = source_start + timedelta(minutes=180)
+        real_end = source_end + timedelta(minutes=180)
+        self.assertEqual(result["changed"], 1)
+        self.assertEqual(rec.start_time, real_start - timedelta(minutes=5))
+        self.assertEqual(rec.end_time, real_end + timedelta(minutes=10))
+        p = rec.custom_properties["program"]
+        self.assertEqual(p["start_time"], real_start.isoformat())
+        self.assertEqual(p["end_time"], real_end.isoformat())
+
+    def test_offset_change_dispatches_reschedule_task(
+        self, mock_reschedule, mock_schedule, mock_artwork
+    ):
+        """Saving a channel with a changed epg_time_offset_minutes dispatches
+        the reschedule task (post_save signal, .save() write path)."""
+        self._set_channel_offset(120)
+        mock_reschedule.delay.assert_called_once()
+
+    def test_offset_save_without_change_does_not_dispatch(
+        self, mock_reschedule, mock_schedule, mock_artwork
+    ):
+        """A channel save that does not change the offset dispatches nothing."""
+        self.channel.name = "Renamed Channel"
+        self.channel.save()
+        mock_reschedule.delay.assert_not_called()
+
+    def test_none_to_zero_toggle_does_not_dispatch(
+        self, mock_reschedule, mock_schedule, mock_artwork
+    ):
+        """None and 0 are equivalent (no shift), so toggling between them
+        does not reschedule."""
+        self._set_channel_offset(0)
+        self._set_channel_offset(None)
+        mock_reschedule.delay.assert_not_called()

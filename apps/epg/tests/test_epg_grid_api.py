@@ -1,3 +1,5 @@
+from unittest.mock import patch
+
 from django.contrib.auth import get_user_model
 from django.test import TestCase
 from django.utils import timezone
@@ -91,8 +93,13 @@ class EpgGridOffsetWindowTests(TestCase):
             self.now + timezone.timedelta(hours=25),
         )
 
-        self.channel.epg_time_offset_minutes = 1440
-        self.channel.save()
+        # The offset-change post_save signal dispatches the recording
+        # reschedule task; keep this display-only test hermetic.
+        with patch(
+            "apps.channels.tasks.reschedule_upcoming_recordings_for_offset_change"
+        ):
+            self.channel.epg_time_offset_minutes = 1440
+            self.channel.save()
 
         self.assertEqual(
             self._titles(),

@@ -347,8 +347,13 @@ class CurrentProgramsAPITests(TestCase):
         # Control: without the offset the lookup uses raw "now", so the
         # channel matches the unshifted "Current Show" window (now-1h..now+1h)
         # instead of the delayed program.
-        channel.epg_time_offset_minutes = None
-        channel.save()
+        # The offset-change post_save signal dispatches the recording
+        # reschedule task; keep this display-only test hermetic.
+        with patch(
+            "apps.channels.tasks.reschedule_upcoming_recordings_for_offset_change"
+        ):
+            channel.epg_time_offset_minutes = None
+            channel.save()
         response = self.client.post(
             CURRENT_PROGRAMS_URL,
             {"channel_uuids": [str(channel.uuid)]},

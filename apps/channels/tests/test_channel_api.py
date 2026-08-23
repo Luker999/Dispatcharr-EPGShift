@@ -1,3 +1,5 @@
+from unittest.mock import patch
+
 from django.test import TestCase
 from django.contrib.auth import get_user_model
 from django.utils import timezone
@@ -687,6 +689,16 @@ class ChannelEpgTimeOffsetAPITests(TestCase):
             name="Offset Channel",
             channel_group=self.group,
         )
+        # Offset changes in these tests must not enqueue a live reschedule
+        # (the post_save signal / bulk path dispatch the reschedule task).
+        self._reschedule_patcher = patch(
+            "apps.channels.tasks.reschedule_upcoming_recordings_for_offset_change"
+        )
+        self.reschedule_task = self._reschedule_patcher.start()
+
+    def tearDown(self):
+        self._reschedule_patcher.stop()
+        super().tearDown()
 
     def test_default_offset_is_null(self):
         self.assertIsNone(self.channel.epg_time_offset_minutes)
@@ -865,3 +877,38 @@ class ChannelEpgTimeOffsetAPITests(TestCase):
         self.channel.refresh_from_db()
         self.assertIsNone(other.epg_time_offset_minutes)
         self.assertIsNone(self.channel.epg_time_offset_minutes)
+
+    def test_bulk_edit_offset_change_dispatches_reschedule(self):
+        """Changing epg_time_offset_minutes through the bulk path (which
+        bypasses post_save) dispatches the recording reschedule task."""
+        response = self.client.patch(
+            self.bulk_edit_url,
+            [{"id": self.channel.id, "epg_time_offset_minutes": 180}],
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.channel.refresh_from_db()
+        self.assertEqual(self.channel.epg_time_offset_minutes, 180)
+        self.reschedule_task.delay.assert_called_once()
+
+    def test_bulk_edit_unchanged_offset_does_not_dispatch(self):
+        """Re-sending the current offset is not a change: no dispatch."""
+        response = self.client.patch(
+            self.bulk_edit_url,
+            [{"id": self.channel.id, "epg_time_offset_minutes": 180}],
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.channel.refresh_from_db()
+        self.assertEqual(self.channel.epg_time_offset_minutes, 180)
+        self.reschedule_task.delay.assert_called_once()
+
+        self.reschedule_task.delay.reset_mock()
+        response = self.client.patch(
+            self.bulk_edit_url,
+            [{"id": self.channel.id, "epg_time_offset_minutes": 180}],
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.reschedule_task.delay.assert_not_called()

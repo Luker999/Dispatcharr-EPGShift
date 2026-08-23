@@ -195,6 +195,57 @@ def refresh_epg_programs(sender, instance, created, **kwargs):
         _queue_epg_program_refresh(instance.epg_data)
 
 
+@receiver(pre_save, sender=Channel)
+def cache_previous_epg_time_offset(sender, instance, **kwargs):
+    """Remember the prior epg_time_offset_minutes so post_save can detect a
+    real change.  The bulk_update API path bypasses signals entirely and
+    dispatches the reschedule explicitly in the view."""
+    if not instance.pk:
+        instance._previous_epg_time_offset = None
+        return
+    instance._previous_epg_time_offset = (
+        Channel.objects.filter(pk=instance.pk)
+        .values_list("epg_time_offset_minutes", flat=True)
+        .first()
+    )
+
+
+@receiver(post_save, sender=Channel)
+def reschedule_recordings_on_epg_offset_change(sender, instance, created, **kwargs):
+    """When a channel's EPG time offset changes, future not-yet-started
+    EPG-based recordings must move to the programme's new real airtime.
+    The reschedule task derives each schedule from the source ProgramData
+    row plus the channel's current offset, so it is correct after any
+    offset change and idempotent.  None and 0 are equivalent (no shift),
+    so toggling between them does not reschedule.
+    """
+    if created:
+        return
+    if not hasattr(instance, "_previous_epg_time_offset"):
+        return  # pre_save did not run (bulk paths dispatch explicitly)
+    previous = instance._previous_epg_time_offset or 0
+    current = instance.epg_time_offset_minutes or 0
+    if previous == current:
+        return
+    logger.info(
+        f"Channel {instance.id} ({instance.name}) EPG time offset changed "
+        f"({instance._previous_epg_time_offset} -> {current}); "
+        f"rescheduling upcoming recordings"
+    )
+    try:
+        from .tasks import reschedule_upcoming_recordings_for_offset_change
+        reschedule_upcoming_recordings_for_offset_change.delay()
+    except Exception:
+        try:
+            from .tasks import reschedule_upcoming_recordings_for_offset_change_impl
+            reschedule_upcoming_recordings_for_offset_change_impl()
+        except Exception:
+            logger.exception(
+                f"Failed to reschedule recordings after EPG offset change "
+                f"for channel {instance.id}"
+            )
+
+
 @receiver(pre_save, sender=ChannelOverride)
 def cache_previous_override_epg(sender, instance, **kwargs):
     """Remember prior epg_data_id so post_save can detect real EPG changes."""

@@ -126,7 +126,7 @@ def _pick_best_image_from_epg_props(epg_props):
         return None
 
 
-def _match_epg_program_by_timeslot(channel_epg_data, rec_start, rec_end):
+def _match_epg_program_by_timeslot(channel_epg_data, rec_start, rec_end, offset_minutes=None):
     """Find an EPG program that covers at least 80% of the recording window.
 
     Queries all programs overlapping the recording, calculates overlap for
@@ -134,10 +134,20 @@ def _match_epg_program_by_timeslot(channel_epg_data, rec_start, rec_end):
     recording duration.  Recordings spanning multiple programs with no
     dominant show return None (displayed as "Custom Recording").
     Returns a dict with id, title, sub_title, and description, or None.
+
+    ``offset_minutes`` is the channel's EPG time offset.  The recording
+    window is the real airtime on the channel, so the source EPG is looked
+    up at ``recording_time - offset`` (a positive offset means the channel
+    airs the source programmes later).  ``None`` or ``0`` keeps the
+    unshifted behaviour.
     """
     if not channel_epg_data or not rec_start or not rec_end:
         return None
     try:
+        if offset_minutes:
+            shift = timedelta(minutes=offset_minutes)
+            rec_start = rec_start - shift
+            rec_end = rec_end - shift
         candidates = channel_epg_data.programs.filter(
             start_time__lt=rec_end,
             end_time__gt=rec_start,
@@ -167,6 +177,28 @@ def _match_epg_program_by_timeslot(channel_epg_data, rec_start, rec_end):
     except Exception:
         pass
     return None
+
+
+def _enrich_program_from_epg_timeslot(channel, rec_start, rec_end, program):
+    """Enrich an empty manual-recording program dict from the channel EPG.
+
+    ``program`` is returned untouched when it is not a dict or already
+    carries EPG/user-sourced identity (user_edited, id or title).  The
+    real recording window is matched against the source EPG shifted by the
+    channel's ``epg_time_offset_minutes`` so the programme actually airing
+    on a delayed/advanced channel is selected.  Returns the program dict.
+    """
+    if not isinstance(program, dict):
+        return program
+    if program.get("user_edited") or program.get("id") or program.get("title"):
+        return program
+    epg_match = _match_epg_program_by_timeslot(
+        channel.epg_data, rec_start, rec_end,
+        offset_minutes=channel.epg_time_offset_minutes,
+    )
+    if epg_match:
+        program.update(epg_match)
+    return program
 
 
 # Default: transient DB errors only. InterfaceError is a sibling of
@@ -522,7 +554,7 @@ def _evaluate_series_rules_locked(tvg_id, result):
         post_min = 0
 
     # Preload existing recordings keyed by stable program attributes that
-    # survive EPG refreshes (tvg_id + original start/end times stored in
+    # survive EPG refreshes (tvg_id + real start/end times stored in
     # custom_properties).  ProgramData.id changes on every EPG refresh so
     # it cannot be used for deduplication.  Only load future recordings
     # to bound the set size — past recordings cannot collide with newly
@@ -556,21 +588,56 @@ def _evaluate_series_rules_locked(tvg_id, result):
             result["details"].append({"tvg_id": rv_tvg, "status": "invalid_rule"})
             continue
 
+        epg = None
         if rv_tvg:
             epg = EPGData.objects.filter(tvg_id=rv_tvg).first()
             if not epg:
                 result["details"].append({"tvg_id": rv_tvg, "status": "no_epg_match"})
                 continue
+
+        # Resolve the recording channel before fetching programmes so the
+        # source-programme window can be widened by the channel's EPG time
+        # offset (a positive offset means the channel airs later).
+        channels_by_epg_id = None
+        if pinned_channel_id is not None:
+            pinned_channel = Channel.objects.filter(id=pinned_channel_id).first()
+            if pinned_channel is None:
+                result["details"].append({"tvg_id": rv_tvg, "status": "pinned_channel_missing", "channel_id": pinned_channel_id})
+                continue
+        elif rv_tvg:
+            pinned_channel = Channel.objects.filter(epg_data=epg).order_by("channel_number").first()
+            if not pinned_channel:
+                result["details"].append({"tvg_id": rv_tvg, "status": "no_channel_for_epg"})
+                continue
+        else:
+            pinned_channel = None
+
+        # M = maximum |epg_time_offset_minutes| needed by the relevant
+        # channels.  Title-only rules may match any channel's EPG, so use
+        # the global maximum.
+        if pinned_channel is not None:
+            offset_pad = abs(pinned_channel.epg_time_offset_minutes or 0)
+        else:
+            from django.db.models import Max
+            from django.db.models.functions import Abs
+            offset_pad = Channel.objects.aggregate(
+                max_offset=Max(Abs("epg_time_offset_minutes"))
+            )["max_offset"] or 0
+        window_pad = timedelta(minutes=offset_pad)
+
+        # Fetch a safe source-programme superset; the exact real-airtime
+        # filter is applied per programme below, once the recording channel
+        # and its offset are known.
+        if rv_tvg:
             programs_qs = ProgramData.objects.filter(
                 epg=epg,
-                end_time__gt=now,
-                start_time__lte=horizon,
+                end_time__gt=now - window_pad,
+                start_time__lte=horizon + window_pad,
             )
         else:
-            epg = None
             programs_qs = ProgramData.objects.select_related("epg").filter(
-                end_time__gt=now,
-                start_time__lte=horizon,
+                end_time__gt=now - window_pad,
+                start_time__lte=horizon + window_pad,
             )
 
         from apps.epg.query_utils import parse_text_query
@@ -594,20 +661,7 @@ def _evaluate_series_rules_locked(tvg_id, result):
 
         programs = list(programs_qs.distinct().order_by("start_time"))
 
-        if pinned_channel_id is not None:
-            pinned_channel = Channel.objects.filter(id=pinned_channel_id).first()
-            if pinned_channel is None:
-                result["details"].append({"tvg_id": rv_tvg, "status": "pinned_channel_missing", "channel_id": pinned_channel_id})
-                continue
-            channels_by_epg_id = None
-        elif rv_tvg:
-            pinned_channel = Channel.objects.filter(epg_data=epg).order_by("channel_number").first()
-            if not pinned_channel:
-                result["details"].append({"tvg_id": rv_tvg, "status": "no_channel_for_epg"})
-                continue
-            channels_by_epg_id = None
-        else:
-            pinned_channel = None
+        if pinned_channel is None:
             epg_ids = {p.epg_id for p in programs}
             channels_by_epg_id = {}
             for ch in Channel.objects.filter(epg_data_id__in=epg_ids).order_by("channel_number"):
@@ -656,12 +710,19 @@ def _evaluate_series_rules_locked(tvg_id, result):
                     pass
             programs = filtered
 
-        # Pick the earliest airing for each episode key
+        def _real_start(p):
+            """Shifted real start time on the programme's recording channel."""
+            ch = pinned_channel if pinned_channel is not None else channels_by_epg_id.get(p.epg_id)
+            offset = (ch.epg_time_offset_minutes or 0) if ch is not None else 0
+            return p.start_time + timedelta(minutes=offset)
+
+        # Pick the earliest airing for each episode key, comparing shifted
+        # real start times (source start + the channel's EPG offset).
         earliest_by_key = {}
         for p in programs:
             k = _episode_key(p)
             cur = earliest_by_key.get(k)
-            if cur is None or p.start_time < cur.start_time:
+            if cur is None or _real_start(p) < _real_start(cur):
                 earliest_by_key[k] = p
 
         unique_programs = list(earliest_by_key.values())
@@ -675,27 +736,39 @@ def _evaluate_series_rules_locked(tvg_id, result):
                     rec_channel = channels_by_epg_id.get(prog.epg_id)
                     if rec_channel is None:
                         continue
+                # Real airtime on the recording channel: a positive
+                # epg_time_offset_minutes means the channel airs the source
+                # programme that many minutes later.
+                offset = rec_channel.epg_time_offset_minutes or 0
+                real_start = prog.start_time + timedelta(minutes=offset)
+                real_end = prog.end_time + timedelta(minutes=offset)
+                # Exact real-airtime filter (unshifted when offset is null/0):
+                # skip programmes whose shifted airing has already ended or
+                # starts beyond the scheduling horizon.
+                if not (real_end > now and real_start <= horizon):
+                    continue
                 # Skip if a recording already exists for this exact airing
-                # (keyed by tvg_id + original program times, which are stable
-                # across EPG refreshes unlike ProgramData.id).
-                prog_key = (str(prog.tvg_id), prog.start_time.isoformat(), prog.end_time.isoformat())
+                # (keyed by tvg_id + real start/end times, which are stable
+                # across EPG refreshes unlike ProgramData.id and align with
+                # recordings created from the shifted guide).
+                prog_key = (str(prog.tvg_id), real_start.isoformat(), real_end.isoformat())
                 if prog_key in existing_program_keys:
                     continue
                 # Extra guard: DB query using the same stable attributes
-                # stored in custom_properties (unadjusted program times,
-                # not offset-adjusted Recording.start_time/end_time).
+                # stored in custom_properties (real airtimes, not
+                # padding-adjusted Recording.start_time/end_time).
                 try:
                     if Recording.objects.filter(
                         custom_properties__program__tvg_id=prog.tvg_id,
-                        custom_properties__program__start_time=prog.start_time.isoformat(),
-                        custom_properties__program__end_time=prog.end_time.isoformat(),
+                        custom_properties__program__start_time=real_start.isoformat(),
+                        custom_properties__program__end_time=real_end.isoformat(),
                     ).exists():
                         continue
                 except Exception:
                     continue  # already scheduled/recorded
 
-                adj_start = prog.start_time
-                adj_end = prog.end_time
+                adj_start = real_start
+                adj_end = real_end
                 try:
                     if pre_min and pre_min > 0:
                         adj_start = adj_start - timedelta(minutes=pre_min)
@@ -712,14 +785,17 @@ def _evaluate_series_rules_locked(tvg_id, result):
                     start_time=adj_start,
                     end_time=adj_end,
                     custom_properties={
+                        # program stores the shifted real airtimes (source
+                        # times + channel offset) plus the original source
+                        # program id and metadata.
                         "program": {
                             "id": prog.id,
                             "tvg_id": prog.tvg_id,
                             "title": prog.title,
                             "sub_title": prog.sub_title,
                             "description": prog.description,
-                            "start_time": prog.start_time.isoformat(),
-                            "end_time": prog.end_time.isoformat(),
+                            "start_time": real_start.isoformat(),
+                            "end_time": real_end.isoformat(),
                         }
                     },
                 )
@@ -751,14 +827,35 @@ def evaluate_series_rules(tvg_id: str | None = None):
 
 
 def reschedule_upcoming_recordings_for_offset_change_impl():
-    """Recalculate start/end for all future EPG-based recordings using current DVR offsets.
+    """Recalculate start/end for all future EPG-based recordings.
 
-    Only recordings that have not yet started (start_time > now) and that were
-    scheduled from EPG data (custom_properties.program present) are updated.
+    Only recordings that have not yet started (start_time > now) and that
+    carry EPG program data (custom_properties.program) are updated.  Active
+    and finished recordings (status recording/completed/stopped/interrupted)
+    are never modified.
+
+    When the stored program id still resolves to a ProgramData row, the new
+    schedule is derived from the source programme plus the channel's current
+    EPG time offset:
+        real_start = source.start_time + offset
+        real_end   = source.end_time + offset
+    with the DVR pre/post padding applied to those real airtimes, and the
+    stored program times updated to the new real airtimes (the original
+    source program id and metadata are retained).  The stored (already
+    shifted) times are never used as the shift base — adding the current
+    offset to them would double-shift — which also makes repeated runs with
+    an unchanged offset idempotent.
+
+    Recordings whose source row no longer exists (EPG refreshes replace
+    program rows and ids) or that carry no program id (e.g. recurring rule
+    recordings) fall back to the stored airtimes with only the pre/post
+    padding re-applied; missing source rows are counted in
+    ``missing_programs`` and logged.
     """
     from django.utils import timezone
     from django.utils.dateparse import parse_datetime
     from apps.channels.models import Recording
+    from apps.epg.models import ProgramData
 
     now = timezone.now()
 
@@ -771,27 +868,61 @@ def reschedule_upcoming_recordings_for_offset_change_impl():
     except Exception:
         post_min = 0
 
+    # Never reschedule an active or finished recording.
+    protected_statuses = ("recording", "completed", "stopped", "interrupted")
+
     changed = 0
     scanned = 0
+    missing_programs = 0
 
-    for rec in Recording.objects.filter(start_time__gt=now).iterator():
+    for rec in Recording.objects.filter(start_time__gt=now).select_related("channel").iterator():
         scanned += 1
         try:
             cp = rec.custom_properties or {}
             program = cp.get("program") if isinstance(cp, dict) else None
             if not isinstance(program, dict):
                 continue
+            if cp.get("status", "") in protected_statuses:
+                continue
             base_start = program.get("start_time")
             base_end = program.get("end_time")
             if not base_start or not base_end:
                 continue
-            start_dt = parse_datetime(str(base_start))
-            end_dt = parse_datetime(str(base_end))
-            if start_dt is None or end_dt is None:
+            stored_start = parse_datetime(str(base_start))
+            stored_end = parse_datetime(str(base_end))
+            if stored_start is None or stored_end is None:
                 continue
 
-            adj_start = start_dt
-            adj_end = end_dt
+            # Preferred base: the source programme plus the channel's
+            # current EPG time offset.
+            source = None
+            program_id = program.get("id")
+            if program_id is not None:
+                source = (
+                    ProgramData.objects.filter(id=program_id)
+                    .only("start_time", "end_time")
+                    .first()
+                )
+                if source is None:
+                    # Source row is gone (EPG refresh).  Keep the stored
+                    # airtimes rather than guessing: they are the last known
+                    # real airtimes, and re-applying only the pre/post
+                    # padding below cannot double-shift them.
+                    missing_programs += 1
+                    logger.warning(
+                        f"Reschedule: recording {rec.id} source program "
+                        f"{program_id} no longer exists; keeping stored airtimes"
+                    )
+
+            if source is not None:
+                offset = rec.channel.epg_time_offset_minutes or 0
+                real_start = source.start_time + timedelta(minutes=offset)
+                real_end = source.end_time + timedelta(minutes=offset)
+            else:
+                real_start, real_end = stored_start, stored_end
+
+            adj_start = real_start
+            adj_end = real_end
             try:
                 if pre_min and pre_min > 0:
                     adj_start = adj_start - timedelta(minutes=pre_min)
@@ -803,10 +934,25 @@ def reschedule_upcoming_recordings_for_offset_change_impl():
             except Exception:
                 pass
 
-            if rec.start_time != adj_start or rec.end_time != adj_end:
+            program_times_changed = source is not None and (
+                program.get("start_time") != real_start.isoformat()
+                or program.get("end_time") != real_end.isoformat()
+            )
+            if (
+                rec.start_time != adj_start
+                or rec.end_time != adj_end
+                or program_times_changed
+            ):
+                update_fields = ["start_time", "end_time"]
+                if program_times_changed:
+                    program["start_time"] = real_start.isoformat()
+                    program["end_time"] = real_end.isoformat()
+                    cp["program"] = program
+                    rec.custom_properties = cp
+                    update_fields.append("custom_properties")
                 rec.start_time = adj_start
                 rec.end_time = adj_end
-                rec.save(update_fields=["start_time", "end_time"])
+                rec.save(update_fields=update_fields)
                 changed += 1
         except Exception:
             continue
@@ -814,11 +960,21 @@ def reschedule_upcoming_recordings_for_offset_change_impl():
     # Notify frontend to refresh
     try:
         from core.utils import send_websocket_update
-        send_websocket_update('updates', 'update', {"success": True, "type": "recordings_refreshed", "rescheduled": changed})
+        send_websocket_update(
+            'updates', 'update',
+            {"success": True, "type": "recordings_refreshed",
+             "rescheduled": changed, "missing_programs": missing_programs},
+        )
     except Exception:
         pass
 
-    return {"changed": changed, "scanned": scanned, "pre": pre_min, "post": post_min}
+    return {
+        "changed": changed,
+        "scanned": scanned,
+        "missing_programs": missing_programs,
+        "pre": pre_min,
+        "post": post_min,
+    }
 
 
 @shared_task
@@ -1468,14 +1624,11 @@ def run_recording(recording_id, channel_id, start_time_str, end_time_str):
         # Determine program info (may include id for deeper details)
         program = cp.get("program") or {}
 
-        # Enrich empty program dicts (manual recordings) from EPG time-slot data.
-        if isinstance(program, dict) and not program.get("user_edited") and not program.get("id") and not program.get("title"):
-            epg_match = _match_epg_program_by_timeslot(
-                channel.epg_data, recording_obj.start_time, recording_obj.end_time,
-            )
-            if epg_match:
-                program.update(epg_match)
-                cp["program"] = program
+        # Enrich empty program dicts (manual recordings) from EPG time-slot
+        # data, shifting the lookup by the channel's EPG time offset.
+        cp["program"] = _enrich_program_from_epg_timeslot(
+            channel, recording_obj.start_time, recording_obj.end_time, program,
+        )
 
         # Resume into the existing working set if this task is a recovery run.
         # `recover_recordings_on_startup` re-dispatches `run_recording` for an
@@ -3248,15 +3401,12 @@ def prefetch_recording_artwork(recording_id):
 
         program = cp.get("program") or {}
 
-        # Enrich empty program dicts (manual recordings) from EPG time-slot data.
+        # Enrich empty program dicts (manual recordings) from EPG time-slot
+        # data, shifting the lookup by the channel's EPG time offset.
         # Persists matched title/description for display in the recording card.
-        if isinstance(program, dict) and not program.get("user_edited") and not program.get("id") and not program.get("title"):
-            epg_match = _match_epg_program_by_timeslot(
-                rec.channel.epg_data, rec.start_time, rec.end_time,
-            )
-            if epg_match:
-                program.update(epg_match)
-                cp["program"] = program
+        cp["program"] = _enrich_program_from_epg_timeslot(
+            rec.channel, rec.start_time, rec.end_time, program,
+        )
 
         poster_logo_id, poster_url = _resolve_poster_for_program(
             rec.channel.name, program, channel_logo_id=rec.channel.logo_id,
