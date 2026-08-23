@@ -18,7 +18,7 @@ from django.urls import reverse
 from django.utils import timezone as django_timezone
 
 from apps.channels.models import Channel, ChannelProfile, Stream
-from apps.channels.utils import format_channel_number
+from apps.channels.utils import derive_schedule_variant_ids, format_channel_number
 from apps.epg.models import ProgramData
 from apps.epg.utils import sd_poster_proxy_path
 from apps.output.streaming_chunk_cache import stream_cached_response
@@ -1217,6 +1217,29 @@ def generate_epg(request, profile_name=None, user=None, *, xc_catchup_prev_days=
                 channel_num_map[channel_id] = candidate
                 used_numbers.add(candidate)
 
+        # Schedule-variant export IDs: the identity represents the
+        # (source schedule, offset) pair, not the physical channel. Base IDs
+        # keep the existing tvg_id_source derivation; the shared helper adds
+        # the offset suffix and deterministic collision handling so M3U and
+        # XMLTV can never drift.
+        channel_base_ids = []
+        for channel in channels:
+            # user is set only for XC clients, which require integer channel numbers
+            if user is not None:
+                formatted_channel_number = channel_num_map[channel.id]
+            else:
+                formatted_channel_number = format_channel_number(channel.effective_channel_number)
+            if tvg_id_source == 'tvg_id' and channel.effective_tvg_id:
+                base_id = channel.effective_tvg_id
+            elif tvg_id_source == 'gracenote' and channel.effective_tvc_guide_stationid:
+                base_id = channel.effective_tvc_guide_stationid
+            else:
+                base_id = str(formatted_channel_number) if formatted_channel_number != "" else str(channel.id)
+            channel_base_ids.append((channel, base_id))
+        export_id_by_channel, variant_representatives = derive_schedule_variant_ids(
+            channel_base_ids, tvg_id_source
+        )
+
         # Host/port/scheme are constant per request; precompute logo URL prefix once.
         _base_url = request_origin
         _sample_logo_path = reverse("api:channels:logo-cache", args=[0])
@@ -1225,7 +1248,9 @@ def generate_epg(request, profile_name=None, user=None, *, xc_catchup_prev_days=
         _logo_url_suffix = "/" + _logo_suffix_raw
 
         dummy_program_list = []
-        real_epg_map = {}
+        dummy_variant_seen = set()
+        variant_epg_map = {}
+        epg_variant_list = {}
         channel_xml_batch = []
 
         for channel in channels:
@@ -1233,21 +1258,9 @@ def generate_epg(request, profile_name=None, user=None, *, xc_catchup_prev_days=
             effective_epg_data = channel.effective_epg_data_obj
             effective_epg_data_id = channel.effective_epg_data_id
             effective_logo = channel.effective_logo_obj
-            effective_number = channel.effective_channel_number
 
-            # user is set only for XC clients, which require integer channel numbers
-            if user is not None:
-                formatted_channel_number = channel_num_map[channel.id]
-            else:
-                formatted_channel_number = format_channel_number(effective_number)
-
-            # Determine the channel ID based on the selected source
-            if tvg_id_source == 'tvg_id' and channel.effective_tvg_id:
-                channel_id = channel.effective_tvg_id
-            elif tvg_id_source == 'gracenote' and channel.effective_tvc_guide_stationid:
-                channel_id = channel.effective_tvc_guide_stationid
-            else:
-                channel_id = str(formatted_channel_number) if formatted_channel_number != "" else str(channel.id)
+            channel_id = export_id_by_channel[channel.id]
+            variant_offset = channel.epg_time_offset_minutes or 0
 
             tvg_logo = ""
 
@@ -1307,10 +1320,14 @@ def generate_epg(request, profile_name=None, user=None, *, xc_catchup_prev_days=
                         tvg_logo = direct_logo
                     else:
                         tvg_logo = f"{_logo_url_prefix}{effective_logo.id}{_logo_url_suffix}"
-            channel_xml_batch.append(f'  <channel id="{html.escape(channel_id)}">')
-            channel_xml_batch.append(f'    <display-name>{html.escape(effective_name)}</display-name>')
-            channel_xml_batch.append(f'    <icon src="{html.escape(tvg_logo)}" />')
-            channel_xml_batch.append("  </channel>")
+            # Deduplicate by export ID: the first physical channel in the
+            # export order (the variant representative) supplies the display
+            # name, icon and other metadata for the shared variant.
+            if variant_representatives[channel_id] is channel:
+                channel_xml_batch.append(f'  <channel id="{html.escape(channel_id)}">')
+                channel_xml_batch.append(f'    <display-name>{html.escape(effective_name)}</display-name>')
+                channel_xml_batch.append(f'    <icon src="{html.escape(tvg_logo)}" />')
+                channel_xml_batch.append("  </channel>")
 
             if len(channel_xml_batch) >= _EPG_CHANNEL_XML_BATCH_SIZE * 4:
                 yield '\n'.join(channel_xml_batch) + '\n'
@@ -1342,32 +1359,56 @@ def generate_epg(request, profile_name=None, user=None, *, xc_catchup_prev_days=
                         )
 
             if not effective_epg_data:
-                dummy_program_list.append((channel_id, pattern_match_name, None))
+                if channel_id not in dummy_variant_seen:
+                    dummy_variant_seen.add(channel_id)
+                    dummy_program_list.append((channel_id, pattern_match_name, None, variant_offset))
             elif effective_epg_data.epg_source and effective_epg_data.epg_source.source_type == 'dummy':
-                dummy_program_list.append((channel_id, pattern_match_name, effective_epg_data.epg_source))
+                if channel_id not in dummy_variant_seen:
+                    dummy_variant_seen.add(channel_id)
+                    dummy_program_list.append((channel_id, pattern_match_name, effective_epg_data.epg_source, variant_offset))
             else:
-                real_epg_map.setdefault(effective_epg_data_id, []).append(channel_id)
+                if channel_id not in variant_epg_map:
+                    variant_epg_map[channel_id] = effective_epg_data_id
+                    epg_variant_list.setdefault(effective_epg_data_id, []).append(
+                        (channel_id, variant_offset)
+                    )
 
         if channel_xml_batch:
             yield '\n'.join(channel_xml_batch) + '\n'
 
         del channels
         del channel_num_map
+        del channel_base_ids
+        del export_id_by_channel
+        del variant_representatives
 
         batch_size = _EPG_PROGRAM_YIELD_BATCH_SIZE
 
-        all_epg_ids = list(real_epg_map.keys())
+        all_epg_ids = list(epg_variant_list.keys())
         if all_epg_ids:
+            # Variants display source times shifted by their channel offset,
+            # so the raw window must cover the union of all shifted display
+            # windows: the window start moves backwards by the largest
+            # positive offset and the window end moves forwards by the
+            # absolute value of the most negative offset (asymmetric on
+            # purpose). With no offsets this is exactly the original window.
+            variant_offsets = [
+                offset
+                for variants in epg_variant_list.values()
+                for _export_id, offset in variants
+            ]
+            raw_lookback = lookback_cutoff - timedelta(minutes=max(variant_offsets))
             if num_days > 0:
+                raw_cutoff = cutoff_date - timedelta(minutes=min(variant_offsets))
                 programs_qs = ProgramData.objects.filter(
                     epg_id__in=all_epg_ids,
-                    end_time__gte=lookback_cutoff,
-                    start_time__lt=cutoff_date,
+                    end_time__gte=raw_lookback,
+                    start_time__lt=raw_cutoff,
                 )
             else:
                 programs_qs = ProgramData.objects.filter(
                     epg_id__in=all_epg_ids,
-                    end_time__gte=lookback_cutoff,
+                    end_time__gte=raw_lookback,
                 )
 
             programs_base_qs = programs_qs.order_by('epg_id', 'id').values(
@@ -1376,8 +1417,7 @@ def generate_epg(request, profile_name=None, user=None, *, xc_catchup_prev_days=
             )
 
             current_epg_id = None
-            channel_ids_for_epg = None
-            escaped_primary_cid = None
+            offset_groups = None
             pending = []
             program_batch = []
             chunk_size = _EPG_PROGRAM_DB_CHUNK_SIZE
@@ -1390,21 +1430,12 @@ def generate_epg(request, profile_name=None, user=None, *, xc_catchup_prev_days=
                 if not pending:
                     return
                 pending.sort(key=lambda row: (row[0], row[1]))
-                escaped_primary = (
-                    escaped_primary_cid if len(channel_ids_for_epg) > 1 else None
-                )
-                for _, _, xml_text in pending:
-                    program_batch.append(xml_text)
-                    if escaped_primary:
-                        for cid in channel_ids_for_epg[1:]:
-                            program_batch.append(xml_text.replace(
-                                f'channel="{escaped_primary}"',
-                                f'channel="{html.escape(cid)}"',
-                                1,
-                            ))
-                    if len(program_batch) >= batch_size:
-                        yield '\n'.join(program_batch) + '\n'
-                        program_batch = []
+                for _start, _prog_id, entries in pending:
+                    for xml_text in entries:
+                        program_batch.append(xml_text)
+                        if len(program_batch) >= batch_size:
+                            yield '\n'.join(program_batch) + '\n'
+                            program_batch = []
                 pending.clear()
 
             while True:
@@ -1425,18 +1456,33 @@ def generate_epg(request, profile_name=None, user=None, *, xc_catchup_prev_days=
                     if epg_id != current_epg_id:
                         yield from flush_pending()
                         current_epg_id = epg_id
-                        channel_ids_for_epg = real_epg_map[epg_id]
-                        escaped_primary_cid = html.escape(channel_ids_for_epg[0])
+                        # Group the EPG's variants by offset, keeping first-
+                        # channel order. Variants sharing an offset emit the
+                        # same shifted times, so the programme XML is built
+                        # once per (programme, offset) and only the channel
+                        # attribute is swapped for the extra variants.
+                        offset_groups = []
+                        group_index = {}
+                        for export_id, offset in epg_variant_list[epg_id]:
+                            idx = group_index.get(offset)
+                            if idx is None:
+                                group_index[offset] = len(offset_groups)
+                                offset_groups.append(
+                                    (timedelta(minutes=offset), [export_id])
+                                )
+                            else:
+                                offset_groups[idx][1].append(export_id)
 
                     # DB datetimes are UTC (USE_TZ=True, TIME_ZONE=UTC); format
                     # directly instead of strftime("%Y%m%d%H%M%S %z"), which is
                     # ~10x slower and dominates XML build over 750k rows.
                     st = prog['start_time']
                     et = prog['end_time']
-                    start_str = f"{st.year:04d}{st.month:02d}{st.day:02d}{st.hour:02d}{st.minute:02d}{st.second:02d} +0000"
-                    stop_str = f"{et.year:04d}{et.month:02d}{et.day:02d}{et.hour:02d}{et.minute:02d}{et.second:02d} +0000"
 
-                    program_xml = [f'  <programme start="{start_str}" stop="{stop_str}" channel="{escaped_primary_cid}">']
+                    # The body is independent of the variant's offset and
+                    # channel ID; build it once and reuse it for every
+                    # variant of this programme.
+                    program_xml = []
                     program_xml.append(f'    <title>{html.escape(prog["title"])}</title>')
 
                     if prog['sub_title']:
@@ -1635,10 +1681,30 @@ def generate_epg(request, profile_name=None, user=None, *, xc_catchup_prev_days=
                         if custom_data.get('live', False):
                             program_xml.append('    <live />')
 
-                    program_xml.append("  </programme>")
+                    # One set of entries per variant: the primary variant gets
+                    # the full XML, the other variants sharing its offset
+                    # reuse it with only the channel attribute swapped.
+                    entries = []
+                    for offset_delta, export_ids in offset_groups:
+                        st_variant = st + offset_delta
+                        et_variant = et + offset_delta
+                        start_str = f"{st_variant.year:04d}{st_variant.month:02d}{st_variant.day:02d}{st_variant.hour:02d}{st_variant.minute:02d}{st_variant.second:02d} +0000"
+                        stop_str = f"{et_variant.year:04d}{et_variant.month:02d}{et_variant.day:02d}{et_variant.hour:02d}{et_variant.minute:02d}{et_variant.second:02d} +0000"
 
-                    xml_text = '\n'.join(program_xml)
-                    pending.append((prog['start_time'], prog['id'], xml_text))
+                        escaped_primary_cid = html.escape(export_ids[0])
+                        xml_text = '\n'.join(
+                            [f'  <programme start="{start_str}" stop="{stop_str}" channel="{escaped_primary_cid}">']
+                            + program_xml
+                            + ["  </programme>"]
+                        )
+                        entries.append(xml_text)
+                        for cid in export_ids[1:]:
+                            entries.append(xml_text.replace(
+                                f'channel="{escaped_primary_cid}"',
+                                f'channel="{html.escape(cid)}"',
+                                1,
+                            ))
+                    pending.append((st, prog['id'], entries))
 
                 del program_chunk
 
@@ -1647,20 +1713,30 @@ def generate_epg(request, profile_name=None, user=None, *, xc_catchup_prev_days=
             if program_batch:
                 yield '\n'.join(program_batch) + '\n'
 
-        del real_epg_map
+        del epg_variant_list
+        del variant_epg_map
 
-        for channel_id, pattern_match_name, epg_source in dummy_program_list:
+        for channel_id, pattern_match_name, epg_source, variant_offset in dummy_program_list:
             program_length_hours = 4
+            # The variant displays source times shifted by its offset, so the
+            # generator works on the display window shifted back by the same
+            # amount (identical to the original window for unshifted
+            # variants), and the generated times are shifted forward.
             dummy_programs = generate_dummy_programs(
                 channel_id, pattern_match_name,
                 num_days=dummy_days,
                 program_length_hours=program_length_hours,
                 epg_source=epg_source,
-                export_lookback=lookback_cutoff,
-                export_cutoff=cutoff_date,
+                export_lookback=lookback_cutoff - timedelta(minutes=variant_offset),
+                export_cutoff=None if cutoff_date is None else cutoff_date - timedelta(minutes=variant_offset),
             )
             if not dummy_programs:
                 continue
+            if variant_offset:
+                dummy_delta = timedelta(minutes=variant_offset)
+                for program in dummy_programs:
+                    program['start_time'] += dummy_delta
+                    program['end_time'] += dummy_delta
             dummy_batch = []
             for program in dummy_programs:
                 start_str = program['start_time'].strftime("%Y%m%d%H%M%S %z")

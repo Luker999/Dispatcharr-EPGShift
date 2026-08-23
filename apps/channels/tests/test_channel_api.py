@@ -912,3 +912,134 @@ class ChannelEpgTimeOffsetAPITests(TestCase):
         )
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.reschedule_task.delay.assert_not_called()
+
+
+class EpgOffsetXmltvCacheInvalidationTests(TestCase):
+    """Phase C: a real offset change drops the XMLTV chunk cache (whose key
+    has no offset); no-op changes do not invalidate or dispatch."""
+
+    def setUp(self):
+        self.user = User.objects.create_user(
+            username="offsetcache", password="testpass123"
+        )
+        self.user.user_level = 10
+        self.user.save()
+        self.client = APIClient()
+        self.client.force_authenticate(user=self.user)
+        self.bulk_edit_url = "/api/channels/channels/edit/bulk/"
+
+        self.group = ChannelGroup.objects.create(name="Offset Cache Group")
+        self.channel = Channel.objects.create(
+            channel_number=10.0,
+            name="Offset Cache Channel",
+            channel_group=self.group,
+        )
+        # Keep the tests off live Celery and the real Redis: assert the
+        # wiring (called / not called) on both invalidation surfaces.
+        self._reschedule_patcher = patch(
+            "apps.channels.tasks.reschedule_upcoming_recordings_for_offset_change"
+        )
+        self.reschedule_task = self._reschedule_patcher.start()
+        self._signal_invalidate_patcher = patch(
+            "apps.channels.signals._invalidate_epg_output_cache"
+        )
+        self.signal_invalidate = self._signal_invalidate_patcher.start()
+        self._bulk_invalidate_patcher = patch(
+            "apps.output.streaming_chunk_cache.invalidate_epg_chunk_cache"
+        )
+        self.bulk_invalidate = self._bulk_invalidate_patcher.start()
+        # An offset change must not queue an EPG source programme refresh.
+        self._refresh_patcher = patch(
+            "apps.channels.signals.parse_programs_for_tvg_id"
+        )
+        self.epg_refresh = self._refresh_patcher.start()
+
+    def tearDown(self):
+        self._refresh_patcher.stop()
+        self._bulk_invalidate_patcher.stop()
+        self._signal_invalidate_patcher.stop()
+        self._reschedule_patcher.stop()
+        super().tearDown()
+
+    def test_single_save_real_offset_change_invalidates_xmltv_cache(self):
+        self.channel.epg_time_offset_minutes = 180
+        self.channel.save()
+
+        self.signal_invalidate.assert_called_once()
+        self.reschedule_task.delay.assert_called_once()
+        self.epg_refresh.delay.assert_not_called()
+
+    def test_single_save_none_to_zero_does_not_invalidate(self):
+        self.channel.epg_time_offset_minutes = 180
+        self.channel.save()
+        self.signal_invalidate.reset_mock()
+        self.reschedule_task.delay.reset_mock()
+
+        # 180 -> None is a real change (shift removed).
+        self.channel.epg_time_offset_minutes = None
+        self.channel.save()
+        self.signal_invalidate.assert_called_once()
+
+        # None -> 0 is equivalent (no shift): no invalidation, no reschedule.
+        self.signal_invalidate.reset_mock()
+        self.channel.epg_time_offset_minutes = 0
+        self.channel.save()
+        self.signal_invalidate.assert_not_called()
+        self.reschedule_task.delay.assert_called_once()  # only the 180 -> None save
+        self.reschedule_task.delay.reset_mock()
+        self.channel.epg_time_offset_minutes = 0
+        self.channel.save()
+        self.signal_invalidate.assert_not_called()
+        self.reschedule_task.delay.assert_not_called()
+
+    def test_single_save_unchanged_offset_does_not_invalidate(self):
+        self.channel.epg_time_offset_minutes = 90
+        self.channel.save()
+        self.signal_invalidate.reset_mock()
+
+        self.channel.name = "Renamed"
+        self.channel.save()
+        self.signal_invalidate.assert_not_called()
+        self.reschedule_task.delay.assert_called_once()  # only the offset save
+
+    def test_bulk_edit_real_offset_change_invalidates_xmltv_cache(self):
+        response = self.client.patch(
+            self.bulk_edit_url,
+            [{"id": self.channel.id, "epg_time_offset_minutes": 180}],
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.channel.refresh_from_db()
+        self.assertEqual(self.channel.epg_time_offset_minutes, 180)
+        self.bulk_invalidate.assert_called_once()
+        self.reschedule_task.delay.assert_called_once()
+
+    def test_bulk_edit_none_to_zero_does_not_invalidate(self):
+        response = self.client.patch(
+            self.bulk_edit_url,
+            [{"id": self.channel.id, "epg_time_offset_minutes": None}],
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.channel.refresh_from_db()
+        self.assertIsNone(self.channel.epg_time_offset_minutes)
+        self.bulk_invalidate.assert_not_called()
+        self.reschedule_task.delay.assert_not_called()
+
+    def test_bulk_edit_unchanged_offset_does_not_invalidate(self):
+        self.channel.epg_time_offset_minutes = 180
+        self.channel.save()
+        self.bulk_invalidate.reset_mock()
+        self.reschedule_task.delay.reset_mock()
+
+        response = self.client.patch(
+            self.bulk_edit_url,
+            [{"id": self.channel.id, "epg_time_offset_minutes": 180}],
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.bulk_invalidate.assert_not_called()
+        self.reschedule_task.delay.assert_not_called()

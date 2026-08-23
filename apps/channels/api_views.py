@@ -1320,9 +1320,14 @@ class ChannelViewSet(viewsets.ModelViewSet):
 
             # A channel's EPG time offset changed: future not-yet-started
             # EPG-based recordings must move to the programme's new real
-            # airtime.  The post_save signal handles single-row saves; the
-            # bulk path dispatches explicitly.
+            # airtime, and the cached XMLTV output (whose cache key has no
+            # offset) must be dropped.  The post_save signal handles
+            # single-row saves; the bulk path does both explicitly.
             if offset_change_ids:
+                from apps.output.streaming_chunk_cache import (
+                    invalidate_epg_chunk_cache,
+                )
+                invalidate_epg_chunk_cache()
                 try:
                     from .tasks import (
                         reschedule_upcoming_recordings_for_offset_change,

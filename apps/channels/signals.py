@@ -212,12 +212,20 @@ def cache_previous_epg_time_offset(sender, instance, **kwargs):
 
 @receiver(post_save, sender=Channel)
 def reschedule_recordings_on_epg_offset_change(sender, instance, created, **kwargs):
-    """When a channel's EPG time offset changes, future not-yet-started
-    EPG-based recordings must move to the programme's new real airtime.
-    The reschedule task derives each schedule from the source ProgramData
-    row plus the channel's current offset, so it is correct after any
-    offset change and idempotent.  None and 0 are equivalent (no shift),
-    so toggling between them does not reschedule.
+    """When a channel's EPG time offset actually changes (None and 0 are
+    equivalent - no shift), two things happen on the same detection:
+
+    * the cached XMLTV output is dropped - its chunk-cache key does not
+      include the offset, so shifted content would otherwise be served
+      stale;
+    * future not-yet-started EPG-based recordings are rescheduled to the
+      programme's new real airtime.  The reschedule task derives each
+      schedule from the source ProgramData row plus the channel's current
+      offset, so it is correct after any offset change and idempotent.
+
+    The previous value is captured by ``cache_previous_epg_time_offset``
+    in pre_save, so both actions share that single lookup. An offset
+    change alone never queues an EPG source programme refresh.
     """
     if created:
         return
@@ -230,8 +238,9 @@ def reschedule_recordings_on_epg_offset_change(sender, instance, created, **kwar
     logger.info(
         f"Channel {instance.id} ({instance.name}) EPG time offset changed "
         f"({instance._previous_epg_time_offset} -> {current}); "
-        f"rescheduling upcoming recordings"
+        f"invalidating XMLTV cache and rescheduling upcoming recordings"
     )
+    _invalidate_epg_output_cache()
     try:
         from .tasks import reschedule_upcoming_recordings_for_offset_change
         reschedule_upcoming_recordings_for_offset_change.delay()

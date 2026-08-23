@@ -55,6 +55,77 @@ def format_channel_number(value, empty=""):
     return value
 
 
+def normalize_epg_time_offset_minutes(value):
+    """Offset in minutes for export display, with None treated as 0."""
+    return value or 0
+
+
+def _schedule_variant_sort_key(pair):
+    """Deterministic export order: effective channel number (NULLs last),
+    then channel id as the tie-breaker."""
+    channel, _base_id = pair
+    number = getattr(channel, "effective_channel_number", None)
+    return (number is None, number if number is not None else 0, channel.id)
+
+
+def derive_schedule_variant_ids(channels_with_base_ids, tvg_id_source):
+    """Derive schedule-variant export IDs for an export's channel set.
+
+    Each entry is a ``(channel, base_id)`` pair where ``base_id`` is the
+    existing canonical base ID for the selected ``tvg_id_source`` (channel
+    number, tvg_id, or gracenote). The returned ID represents the schedule
+    variant (source schedule, offset), not the physical channel:
+
+    * an offset of ``None`` or ``0`` keeps the canonical base ID (clearing
+      an offset returns to it; a ``__0m`` ID is never generated);
+    * a ``channel_number`` source keeps the base ID even for a nonzero
+      offset, because it is already unique per physical channel;
+    * a shared source (tvg_id / gracenote) with a nonzero offset becomes
+      ``"{base}__{offset}m"`` (e.g. ``BBCOne__180m``, ``BBCOne__-45m``).
+
+    Channels using the same source with the same offset share one ID. All
+    canonical base IDs are reserved before any derived ID is assigned; a
+    derived ID that collides with a reserved or already-assigned ID gets
+    deterministic suffixes ``_2``, ``_3``, ... in (effective channel
+    number, channel id) order, so the same ordered channel set always
+    maps identically and two genuinely different variants are never
+    silently merged.
+
+    Returns ``(id_map, representatives)``:
+
+    * ``id_map``: ``{channel.id: export_id}``
+    * ``representatives``: ``{export_id: channel}`` — the first channel in
+      that deterministic order using the ID (supplies display metadata).
+
+    Both XMLTV and M3U must use this helper so their IDs cannot drift.
+    """
+    ordered = sorted(channels_with_base_ids, key=_schedule_variant_sort_key)
+    reserved = {base_id for _channel, base_id in ordered}
+    used = set(reserved)
+    id_map = {}
+    representatives = {}
+    derived_cache = {}
+    for channel, base_id in ordered:
+        offset = normalize_epg_time_offset_minutes(
+            getattr(channel, "epg_time_offset_minutes", None)
+        )
+        if tvg_id_source == "channel_number" or offset == 0:
+            export_id = base_id
+        else:
+            export_id = derived_cache.get((base_id, offset))
+            if export_id is None:
+                export_id = f"{base_id}__{offset}m"
+                suffix = 2
+                while export_id in used:
+                    export_id = f"{base_id}__{offset}m_{suffix}"
+                    suffix += 1
+                used.add(export_id)
+                derived_cache[(base_id, offset)] = export_id
+        id_map[channel.id] = export_id
+        representatives.setdefault(export_id, channel)
+    return id_map, representatives
+
+
 def compute_provider_archive_days_capped():
     """Max ``catchup_days`` across active XC catch-up streams (capped, cached).
 

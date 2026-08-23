@@ -2,7 +2,7 @@ from django.http import HttpResponse, JsonResponse, Http404, HttpResponseForbidd
 import json
 from django.urls import reverse
 from apps.channels.models import Channel, ChannelProfile, ChannelGroup, Stream
-from apps.channels.utils import format_channel_number, is_catchup_enabled
+from apps.channels.utils import derive_schedule_variant_ids, format_channel_number, is_catchup_enabled
 from django.db.models import Prefetch
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_http_methods
@@ -208,6 +208,25 @@ def generate_m3u(request, profile_name=None, user=None):
     # Options: 'channel_number' (default), 'tvg_id', 'gracenote'
     tvg_id_source = request.GET.get('tvg_id_source', 'channel_number').lower()
 
+    # Schedule-variant tvg-ids: same shared mapping as XMLTV so a stream's
+    # tvg-id always matches the XMLTV <channel id> carrying its schedule.
+    # Base IDs keep the existing per-source derivation below.
+    channel_base_ids = []
+    for channel in channels:
+        formatted_channel_number = format_channel_number(channel.effective_channel_number)
+        if tvg_id_source == 'tvg_id' and channel.effective_tvg_id:
+            base_id = channel.effective_tvg_id
+        elif tvg_id_source == 'gracenote' and channel.effective_tvc_guide_stationid:
+            base_id = channel.effective_tvc_guide_stationid
+        else:
+            base_id = str(formatted_channel_number) if formatted_channel_number != "" else str(channel.id)
+        channel_base_ids.append((channel, base_id))
+    export_id_by_channel, _variant_reps = derive_schedule_variant_ids(
+        channel_base_ids, tvg_id_source
+    )
+    channels = [channel for channel, _base_id in channel_base_ids]
+    del channel_base_ids
+
     # Build EPG URL with query parameters if needed
     # Check if this is an XC API request (has username/password in GET params and user is authenticated)
     xc_username = request.GET.get('username')
@@ -270,14 +289,9 @@ def generate_m3u(request, profile_name=None, user=None):
 
         formatted_channel_number = format_channel_number(effective_number)
 
-        # Determine the tvg-id based on the selected source
-        if tvg_id_source == 'tvg_id' and effective_tvg_id_val:
-            tvg_id = effective_tvg_id_val
-        elif tvg_id_source == 'gracenote' and effective_tvc_guide:
-            tvg_id = effective_tvc_guide
-        else:
-            # Default to channel number (original behavior)
-            tvg_id = str(formatted_channel_number) if formatted_channel_number != "" else str(channel.id)
+        # Shared schedule-variant mapping (see above): offset variants get
+        # their own tvg-id, unshifted channels keep the canonical base ID.
+        tvg_id = export_id_by_channel[channel.id]
 
         tvg_name = effective_name
 
@@ -902,6 +916,12 @@ def xc_get_epg(request, user, short=False):
     effective_epg_data = channel.effective_epg_data_obj
     effective_name = channel.effective_name
 
+    # A channel with an EPG offset airs its source programmes shifted in
+    # time, so the source window is queried shifted back by the offset and
+    # the returned start/end times shifted forward by it. The numeric
+    # stream_id / channel_id identity is unchanged.
+    offset_delta = timedelta(minutes=channel.epg_time_offset_minutes or 0)
+
     if effective_epg_data:
         # Check if this is a dummy EPG that generates on-demand
         if effective_epg_data.epg_source and effective_epg_data.epg_source.source_type == 'dummy':
@@ -917,24 +937,28 @@ def xc_get_epg(request, user, short=False):
                 if short:
                     # Short EPG: current and upcoming only (never historical), limited count
                     programs = effective_epg_data.programs.filter(
-                        end_time__gt=now
+                        end_time__gt=now - offset_delta
                     ).order_by('start_time')[:limit]
                 else:
-                    qs = effective_epg_data.programs.filter(end_time__gt=lookback_cutoff)
+                    qs = effective_epg_data.programs.filter(
+                        end_time__gt=lookback_cutoff - offset_delta
+                    )
                     if forward_cutoff:
-                        qs = qs.filter(start_time__lt=forward_cutoff)
+                        qs = qs.filter(start_time__lt=forward_cutoff - offset_delta)
                     programs = qs.order_by('start_time')
         else:
             # Regular EPG with stored programs
             if short:
                 # Short EPG: current and upcoming only (never historical), limited count
                 programs = effective_epg_data.programs.filter(
-                    end_time__gt=now
+                    end_time__gt=now - offset_delta
                 ).order_by('start_time')[:limit]
             else:
-                qs = effective_epg_data.programs.filter(end_time__gt=lookback_cutoff)
+                qs = effective_epg_data.programs.filter(
+                    end_time__gt=lookback_cutoff - offset_delta
+                )
                 if forward_cutoff:
-                    qs = qs.filter(start_time__lt=forward_cutoff)
+                    qs = qs.filter(start_time__lt=forward_cutoff - offset_delta)
                 programs = qs.order_by('start_time')
     else:
         # No EPG data assigned, generate default dummy
@@ -955,6 +979,11 @@ def xc_get_epg(request, user, short=False):
 
         start = program["start_time"] if isinstance(program, dict) else program.start_time
         end = program["end_time"] if isinstance(program, dict) else program.end_time
+        # Display times are the source times shifted by the channel's EPG
+        # offset (no-op when the channel has no offset); this runs before
+        # now_playing / has_archive so they see the aired times too.
+        start = start + offset_delta
+        end = end + offset_delta
 
         # For database programs, use actual ID; for generated dummy programs, create synthetic ID
         if isinstance(program, dict):
