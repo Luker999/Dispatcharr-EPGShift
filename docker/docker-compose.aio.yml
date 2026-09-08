@@ -1,9 +1,9 @@
 services:
   dispatcharr:
     # build:
-    #   context: .
-    #   dockerfile: Dockerfile
-    image: ghcr.io/dispatcharr/dispatcharr:latest
+    #   context: ..
+    #   dockerfile: docker/Dockerfile
+    image: ghcr.io/luker999/dispatcharr-epgshift:latest
     restart: unless-stopped
     container_name: dispatcharr
     ports:
